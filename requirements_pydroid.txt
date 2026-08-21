@@ -1,0 +1,13 @@
+# المتطلبات الأساسية لتشغيل البوت والأغاني على Pydroid 3
+supabase==2.15.0
+realtime==2.4.3
+websockets==14.2
+aiohttp>=3.11.18
+yt-dlp[default]>=2026.7.4
+requests>=2.31.0
+
+# Pillow و arabic-reshaper و python-bidi اختيارية للصور الديناميكية.
+# ثبّتها لاحقًا عندما يتوفر الإنترنت:
+# pip install Pillow arabic-reshaper python-bidi
+
+# إذا كانت الحزم الأساسية مثبتة مسبقًا، يمكن تشغيل bot.py مباشرة.
