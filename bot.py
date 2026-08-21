@@ -343,6 +343,7 @@ last_room = {}      # room_id -> last created_at seen
 seen_dm = set()
 kaf_games = {}
 war_games = {}       # حرب عالمية واحدة: لاعبان من أي غرفتين
+GLOBAL_WAR_KEY = "__global_war__"  # مفتاح ثابت لمباراة حرب واحدة مشتركة بين جميع الغرف
 last_music_started = 0.0
 music_queue = asyncio.Queue()      # room_id, query, source, requester_id, requester_name
 music_state = {}     # room_id -> آخر أغنية شغّلها البوت
