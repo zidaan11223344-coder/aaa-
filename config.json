@@ -42,5 +42,8 @@
   "ai_model": "gpt-5.6-luna",
   "ai_image_model": "gpt-image-2",
   "ai_enabled": true,
-  "verification_enabled": true
+  "verification_enabled": true,
+  "million_cooldown_seconds": 120,
+  "game_result_images_only_after_end": true,
+  "war_global_match": true
 }
