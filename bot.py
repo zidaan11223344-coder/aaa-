@@ -81,8 +81,11 @@ PUBLISHED_POSTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 SOCIAL_EVENTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "social_events.json")
 VIP_USERS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vip_users.json")
 CUSTOM_GAMES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom_games.json")
+CUSTOM_COMMANDS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom_commands.json")
+REPAIR_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repair_state.json")
 TESTING_GAMES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "games", "testing", "games.json")
 TESTING_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "games", "testing", "active_tests.json")
+GAME_DESIGN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "games", "designer_state.json")
 APPROVED_GAMES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "games", "approved")
 
 
@@ -307,14 +310,9 @@ MUSIC_MAX_DURATION = int(C.get("music_max_duration_seconds", 900))
 # على Railway يفضل استخدام RAILWAY_PUBLIC_DOMAIN تلقائياً، أو ضع PUBLIC_BASE_URL يدوياً.
 # استخدم نطاق Railway الحالي أولاً حتى لا يبقى رابط قديم من Environment منسوخ من مشروع آخر.
 _RAILWAY_DOMAIN = str(os.environ.get("RAILWAY_PUBLIC_DOMAIN") or "").strip().strip("/")
-# إذا وضع المالك PUBLIC_BASE_URL يدوياً فهو المصدر الأول، ثم نطاق Railway التلقائي.
-# هذا يمنع بقاء رابط مشروع قديم بعد نسخ Environment Variables.
-_explicit_public_base = str(os.environ.get("PUBLIC_BASE_URL") or "").strip().strip("/")
-if _explicit_public_base and not _explicit_public_base.startswith(("http://", "https://")):
-    _explicit_public_base = "https://" + _explicit_public_base
 PUBLIC_BASE_URL = str(
-    _explicit_public_base
-    or (f"https://{_RAILWAY_DOMAIN}" if _RAILWAY_DOMAIN else "")
+    (f"https://{_RAILWAY_DOMAIN}" if _RAILWAY_DOMAIN else "")
+    or os.environ.get("PUBLIC_BASE_URL")
     or C.get("music_public_base_url")
 ).rstrip("/")
 MEDIA_PATH = "/media"
@@ -359,6 +357,11 @@ SOCIAL_WEBHOOK_TOKEN = str(os.environ.get("SOCIAL_WEBHOOK_TOKEN") or C.get("soci
 http: aiohttp.ClientSession = None
 media_runner = None
 media_site = None
+# حالة تشغيل البوت: تُحدّث باستمرار حتى لا نعتمد على last_seen قديم.
+BOT_STARTED_AT = time.time()
+LAST_HEARTBEAT_AT = 0.0
+LAST_DB_OK_AT = 0.0
+NETWORK_ONLINE = True
 
 # صور الألعاب PNG
 # كتالوج البوت المستقل: لا يقرأ جدول هدايا التطبيق ولا يعرض هداياه.
@@ -857,45 +860,39 @@ async def send_gift_command(rid, sender_uid, sender_name, raw_text):
     return None
 
 
-async def _db_insert(table_name, payload):
-    res, err = await run(lambda: sb.table(table_name).insert(payload).execute())
-    if err:
-        raise RuntimeError(f"{table_name} insert failed: {err}")
-    return res
-
 async def room_send(rid, text):
-    return await _db_insert("room_messages", {
-        "room_id": rid, "user_id": BOT_ID, "content": text or "", "message_type": "text"
-    })
+    await run(lambda: sb.table("room_messages").insert({
+        "room_id": rid, "user_id": BOT_ID, "content": text, "message_type": "text"
+    }).execute())
 
 async def room_send_media(rid, text, media_url, m_type="text", duration_ms=None):
     payload = {
         "room_id": rid,
         "user_id": BOT_ID,
-        "content": text or "",
+        "content": text,
         "message_type": m_type,
         "media_url": media_url,
         "media_duration_ms": duration_ms,
     }
-    return await _db_insert("room_messages", payload)
+    await run(lambda: sb.table("room_messages").insert(payload).execute())
 
 async def dm_send(uid, text):
     envelope = {
-        "v": 1, "id": str(uuid.uuid4()), "content": text or "", "message_type": "text",
+        "v": 1, "id": str(uuid.uuid4()), "content": text, "message_type": "text",
         "media_url": None, "media_duration_ms": None, "reply_to_id": None, "created_at": now_iso()
     }
-    return await _db_insert("dm_relay", {
+    await run(lambda: sb.table("dm_relay").insert({
         "sender_id": BOT_ID, "recipient_id": uid, "envelope": envelope
-    })
+    }).execute())
 
-async def dm_send_media(uid, text, media_url, m_type="image", duration_ms=None):
+async def dm_send_media(uid, text, media_url, m_type="image"):
     envelope = {
         "v": 1, "id": str(uuid.uuid4()), "content": text or "", "message_type": m_type,
-        "media_url": media_url, "media_duration_ms": duration_ms, "reply_to_id": None, "created_at": now_iso()
+        "media_url": media_url, "media_duration_ms": None, "reply_to_id": None, "created_at": now_iso()
     }
-    return await _db_insert("dm_relay", {
+    await run(lambda: sb.table("dm_relay").insert({
         "sender_id": BOT_ID, "recipient_id": uid, "envelope": envelope
-    })
+    }).execute())
 
 
 def _code4():
@@ -976,9 +973,7 @@ async def handle_social_reaction(rid, text, uid, p_name):
     return f"✅ تم تسجيل {labels[action_key]} وإرسال الإشعار إلى خاص الناشر."
 
 async def telegram_find_chat_id():
-    """Find the latest private Telegram chat that interacted with this bot.
-    TELEGRAM_BACKUP_CHAT_ID is optional; the user only needs to send /start to the bot once.
-    """
+    """Return the configured Telegram backup chat, or fall back to the latest private chat."""
     if not TELEGRAM_BOT_TOKEN:
         return None, "⚠️ أضف TELEGRAM_BOT_TOKEN في Railway Variables."
     if TELEGRAM_BACKUP_CHAT_ID:
@@ -994,45 +989,145 @@ async def telegram_find_chat_id():
             for update in reversed(updates):
                 msg = update.get("message") or {}
                 chat = msg.get("chat") or {}
-                if chat.get("type") == "private" and chat.get("id") is not None:
+                if chat.get("id") is not None and chat.get("type") in ("private", "group", "supergroup"):
                     return str(chat["id"]), None
-            return None, "⚠️ لم أجد محادثة خاصة مع البوت. أرسل /start إلى بوت Telegram أولاً ثم أعد أمر نسخ احتياطي."
+            return None, "⚠️ لم أجد محادثة Telegram. ضع TELEGRAM_BACKUP_CHAT_ID في Railway أو أرسل رسالة من المجموعة إلى البوت ثم أعد المحاولة."
     except Exception as exc:
         return None, f"❌ تعذر تحديد محادثة Telegram: {type(exc).__name__}: {exc}"
 
+
+def _backup_excluded(rel: Path) -> bool:
+    """Exclude secrets/cache/runtime junk while keeping the actual bot project and data."""
+    parts = set(rel.parts)
+    name = rel.name
+    # Never put credentials, cookies, local secrets or Python caches into Telegram backups.
+    if name in {
+        ".env", ".env.local", ".env.production", "youtube_cookies.txt", "spotify_cookies.txt",
+        "serviceAccountKey.json", "firebase_credentials.json", "credentials.json",
+    }:
+        return True
+    if any(part in {"__pycache__", ".git", ".venv", "venv", "node_modules"} for part in rel.parts):
+        return True
+    # Generated temporary backup archives must never be recursively backed up.
+    if any(part.startswith("bot_backup_") for part in rel.parts):
+        return True
+    # Common compiled/temp files are not useful for recovery.
+    if name.endswith((".pyc", ".pyo", ".tmp", ".part")):
+        return True
+    return False
+
+
+def _collect_backup_files(root: Path):
+    """Collect all project files, including JSON state and assets, except secrets/cache."""
+    files = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root)
+        if _backup_excluded(rel):
+            continue
+        try:
+            files.append((path, rel.as_posix(), path.stat().st_size))
+        except OSError:
+            log.warning("backup: cannot stat %s", path)
+    files.sort(key=lambda item: item[1])
+    return files
+
+
+def _write_backup_archive(root: Path, archive: Path):
+    files = _collect_backup_files(root)
+    total_bytes = sum(size for _, _, size in files)
+    manifest = {
+        "created_at": now_iso(),
+        "project": root.name,
+        "files": len(files),
+        "bytes": total_bytes,
+        "excluded": [
+            "environment secrets (.env)",
+            "API/service-account credential files",
+            "YouTube/Spotify cookie files",
+            "Python caches (__pycache__, *.pyc)",
+            "git/virtualenv/node_modules directories",
+            "temporary backup archives",
+        ],
+    }
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        z.writestr("BACKUP_MANIFEST.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        for path, rel, _ in files:
+            try:
+                z.write(path, arcname=rel)
+            except OSError:
+                log.warning("backup: skipped unreadable file %s", path)
+    return len(files), total_bytes
+
+
+async def _telegram_send_document(chat_id: str, path: Path, caption: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    form = aiohttp.FormData()
+    form.add_field("chat_id", str(chat_id))
+    form.add_field("caption", caption)
+    with path.open("rb") as fh:
+        form.add_field("document", fh, filename=path.name, content_type="application/zip")
+        async with http.post(url, data=form, timeout=aiohttp.ClientTimeout(total=180)) as resp:
+            body = await resp.text()
+            if resp.status >= 400:
+                return False, f"HTTP {resp.status}: {body[:500]}"
+            try:
+                payload = json.loads(body)
+            except Exception:
+                payload = {}
+            if not payload.get("ok", False):
+                return False, body[:500]
+    return True, "ok"
+
+
 async def telegram_backup():
-    """Create a safe backup and send it using TELEGRAM_BOT_TOKEN only."""
+    """Create a complete recoverable project backup and send it to the configured Telegram group."""
     if not TELEGRAM_BOT_TOKEN:
         return False, "⚠️ أضف TELEGRAM_BOT_TOKEN في Railway Variables."
     chat_id, chat_error = await telegram_find_chat_id()
     if not chat_id:
         return False, chat_error
+
     tmp = Path(tempfile.mkdtemp(prefix="bot_backup_"))
     archive = tmp / f"bot_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.zip"
     try:
-        include = ["rooms.json", "masters.json", "bans.json", "moderation.json", "welcome.json",
-                   "replies.json", "points.json", "vip_users.json", "custom_games.json", "published_posts.json", "social_events.json"]
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
-            # config بدون كلمات مرور/مفاتيح. الأسرار لا تدخل النسخة الاحتياطية.
-            safe_config = dict(C)
-            for secret_key in ("password", "supabase_key", "youtube_cookies", "api_key", "openai_api_key"):
-                safe_config.pop(secret_key, None)
-            z.writestr("config.safe.json", json.dumps(safe_config, ensure_ascii=False, indent=2))
-            for name in include:
-                path = BASE_DIR / name
-                if path.is_file(): z.write(path, arcname=name)
-            logp = BASE_DIR / "logs" / "bot.log"
-            if logp.is_file(): z.write(logp, arcname="logs/bot.log")
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-        form = aiohttp.FormData()
-        form.add_field("chat_id", chat_id)
-        form.add_field("caption", "📦 نسخة احتياطية آمنة للبوت\n🔐 تم استبعاد مفاتيح API وكوكيز YouTube.")
-        form.add_field("document", archive.open("rb"), filename=archive.name, content_type="application/zip")
-        async with http.post(url, data=form, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-            if resp.status >= 400:
-                body = await resp.text()
-                return False, f"❌ فشل رفع النسخة إلى Telegram: HTTP {resp.status} {body[:300]}"
-        return True, "✅ تم إنشاء ورفع النسخة الاحتياطية إلى Telegram."
+        count, total_bytes = await asyncio.to_thread(_write_backup_archive, BASE_DIR, archive)
+        # Telegram's Bot API has a practical per-file limit. Keep a safety margin and split if needed.
+        max_part = 45 * 1024 * 1024
+        if archive.stat().st_size <= max_part:
+            ok, err = await _telegram_send_document(
+                chat_id, archive,
+                f"📦 النسخة الاحتياطية الكاملة للبوت\n📁 الملفات: {count}\n💾 البيانات: {total_bytes / 1024 / 1024:.2f} MB\n🔐 تم استبعاد الأسرار وملفات الكوكيز فقط."
+            )
+            if not ok:
+                return False, f"❌ فشل رفع النسخة إلى Telegram: {err}"
+            return True, "✅ تم إنشاء وإرسال النسخة الاحتياطية الكاملة إلى مجموعة Telegram."
+
+        # Split the ZIP bytes into Telegram-safe parts. The original ZIP remains recoverable by concatenating parts.
+        size = archive.stat().st_size
+        part_paths = []
+        with archive.open("rb") as src:
+            index = 1
+            while True:
+                chunk = src.read(max_part)
+                if not chunk:
+                    break
+                part = tmp / f"{archive.stem}.part{index:03d}.zip.part"
+                part.write_bytes(chunk)
+                part_paths.append(part)
+                index += 1
+        total_parts = len(part_paths)
+        for index, part in enumerate(part_paths, 1):
+            ok, err = await _telegram_send_document(
+                chat_id, part,
+                f"📦 النسخة الاحتياطية الكاملة — الجزء {index}/{total_parts}\n"
+                f"📁 إجمالي الملفات: {count}\n"
+                f"ℹ️ اجمع الأجزاء بالترتيب لإعادة ملف ZIP الأصلي."
+            )
+            if not ok:
+                return False, f"❌ فشل رفع الجزء {index}/{total_parts}: {err}"
+        return True, f"✅ أُرسلت النسخة الاحتياطية الكاملة إلى المجموعة على {total_parts} أجزاء."
     except Exception as exc:
         log.exception("telegram backup failed")
         return False, f"❌ تعذر إنشاء النسخة الاحتياطية: {type(exc).__name__}: {exc}"
@@ -1510,11 +1605,9 @@ async def start_media_server():
         }.get(path.suffix.lower(), "application/octet-stream")
         return web.FileResponse(path, headers={
             "Content-Type": ctype,
-            "Content-Disposition": f'inline; filename="{path.name}"',
             "Accept-Ranges": "bytes",
             "Cache-Control": "public, max-age=86400",
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Expose-Headers": "Content-Length,Content-Range,Accept-Ranges,Content-Type",
         })
 
     app.router.add_get(f"{MEDIA_PATH}/{{name}}", media_handler)
@@ -1677,12 +1770,12 @@ async def _prepare_music_track(track, source_label):
     if err:
         return None, err
     try:
-        if not local_path or not Path(local_path).is_file() or Path(local_path).stat().st_size <= 16 * 1024:
+        if not local_path or not Path(local_path).is_file() or Path(local_path).stat().st_size <= 4096:
             return None, "تم تنزيل الصوت لكن الملف فارغ أو تالف، لذلك لم يتم إرسال بصمة صوت."
         local_path, convert_err = await _convert_audio_to_mp3(local_path)
         if convert_err:
             log.warning(convert_err)
-        if not local_path or not Path(local_path).is_file() or Path(local_path).stat().st_size <= 16 * 1024:
+        if not local_path or not Path(local_path).is_file() or Path(local_path).stat().st_size <= 4096:
             return None, "فشل تجهيز ملف الصوت بعد التحويل؛ تم منع إرسال صوت فارغ."
         duration_ms = await _audio_duration_ms(local_path)
         if duration_ms <= 0:
@@ -2307,6 +2400,11 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     replies = load_replies()
     if text.strip() in replies: return replies[text.strip()]
 
+    # الأوامر التي ينشئها الماستر ديناميكياً. تعمل فوراً بدون تعديل الكود.
+    custom_reply = await execute_custom_command(rid, uid, p_name, text)
+    if custom_reply is not None:
+        return custom_reply
+
     if text.startswith("نشر ") or text.startswith("broadcast "):
         vip_error = await require_vip(uid, p_name, "نظام النشر")
         if vip_error: return vip_error
@@ -2802,16 +2900,6 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     # بالـUID أو اسم الحساب عبر is_master() بدل مقارنة UID باسم مستخدم.
     active_tests = load_active_tests()
     testing_games = load_testing_games()
-    # يمكن للمالك بدء تجربة لعبة مباشرة من الغرفة بصيغة اختبار@command أو تشغيل اختبار@command.
-    if cmd.startswith("اختبار@") or cmd.startswith("الاختبار@"):
-        test_key = _resolve_testing_key(cmd.split("@", 1)[1], testing_games)
-        if not await is_master(uid, p_name):
-            return "🔐 لعبة الاختبار متاحة للمالك/الماستر فقط."
-        if test_key not in testing_games:
-            return f"❌ لا توجد لعبة اختبار باسم «{test_key}». اكتب «العاب الاختبار»."
-        active_tests[test_key] = {"enabled": True, "activated_at": now_iso()}
-        save_active_tests(active_tests)
-        cmd = test_key
     if cmd in active_tests and cmd in testing_games:
         if not await is_master(uid, p_name):
             return "🔐 لعبة الاختبار متاحة للمالك/الماستر فقط."
@@ -2819,6 +2907,8 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         cd_error = await require_game_cooldown(cmd)
         if cd_error:
             return cd_error
+        await room_send(rid, f"🔎 جاري البحث عن {custom.get('title', cmd)}...")
+        await asyncio.sleep(0.5)
         try:
             win_chance = max(1, min(100, int(custom.get("win_chance", 50))))
         except Exception:
@@ -2829,12 +2919,12 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         except Exception:
             delta = 20 if win else -5
         add_points(uid, p_name, delta)
-        image_url = custom.get("image_url")
-        if image_url:
+        if custom.get("image_url"):
             try:
-                await room_send_media(rid, "", image_url, m_type="image")
+                await room_send_media(rid, "", custom.get("image_url"), m_type="image")
             except Exception:
                 pass
+        await send_custom_game_result(rid, custom, p_name, win)
         msg = custom.get("win_message") if win else custom.get("lose_message")
         return f"🧪 اختبار: {msg or ('🎉 فوز!' if win else '😅 خسارة!')} @{p_name}\n💰 {'+' if delta >= 0 else ''}{delta} نقطة"
 
@@ -2847,15 +2937,17 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         cd_error = await require_game_cooldown(cmd)
         if cd_error:
             return cd_error
+        await room_send(rid, f"🔎 جاري البحث عن {custom.get('title', cmd)}...")
+        await asyncio.sleep(0.5)
         win = random.randint(1, 100) <= int(custom.get("win_chance", 50))
         delta = int(custom.get("win_points", 20)) if win else int(custom.get("lose_points", -5))
         add_points(uid, p_name, delta)
-        image_url = custom.get("image_url")
-        if image_url:
+        if custom.get("image_url"):
             try:
-                await room_send_media(rid, "", image_url, m_type="image")
+                await room_send_media(rid, "", custom.get("image_url"), m_type="image")
             except Exception:
                 pass
+        await send_custom_game_result(rid, custom, p_name, win)
         msg = custom.get("win_message") if win else custom.get("lose_message")
         return f"{msg} @{p_name}\n💰 {'+' if delta >= 0 else ''}{delta} نقطة"
 
@@ -2916,6 +3008,150 @@ def load_custom_games():
 def save_custom_games(data):
     save_json(CUSTOM_GAMES_PATH, data)
 
+def load_custom_commands():
+    data = load_json(CUSTOM_COMMANDS_PATH, {})
+    return data if isinstance(data, dict) else {}
+
+def save_custom_commands(data):
+    save_json(CUSTOM_COMMANDS_PATH, data)
+
+def _command_key(text):
+    return normalize_text(text).strip()[:80]
+
+def add_custom_command_definition(command, response):
+    key = _command_key(command)
+    if not key:
+        raise ValueError("اسم الأمر فارغ")
+    if not response:
+        raise ValueError("الرد فارغ")
+    data = load_custom_commands()
+    data[key] = {
+        "command": key,
+        "response": str(response).strip()[:2000],
+        "enabled": True,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    save_custom_commands(data)
+    return data[key]
+
+def delete_custom_command_definition(command):
+    key = _command_key(command)
+    data = load_custom_commands()
+    existed = data.pop(key, None)
+    save_custom_commands(data)
+    return existed
+
+def render_custom_game_cover_sync(game):
+    if not PIL_AVAILABLE:
+        return None
+    title = str(game.get("title") or game.get("command") or "لعبة")[:80]
+    try:
+        img = Image.new("RGB", (1000, 560), (22, 30, 45))
+        draw = ImageDraw.Draw(img)
+        font = None
+        for fp in (str(BASE_DIR / "assets" / "Amiri-Bold.ttf"), "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+            try:
+                if Path(fp).is_file():
+                    font = ImageFont.truetype(fp, 64)
+                    break
+            except Exception:
+                pass
+        font = font or ImageFont.load_default()
+        shaped = shape_text(title)
+        box = draw.textbbox((0,0), shaped, font=font)
+        x=(1000-(box[2]-box[0]))//2
+        draw.text((x+3,170+3), shaped, font=font, fill=(0,0,0))
+        draw.text((x,170), shaped, font=font, fill=(255,255,255))
+        sub=shape_text("🎮 لعبة جديدة — Giant Chat")
+        box=draw.textbbox((0,0), sub, font=font)
+        x=(1000-(box[2]-box[0]))//2
+        draw.text((x,330), sub, font=font, fill=(220,230,240))
+        outdir=BASE_DIR / "generated_games"; outdir.mkdir(exist_ok=True)
+        path=outdir / f"cover_{_command_key(title).replace(' ','_')}_{uuid.uuid4().hex}.jpg"
+        img.save(path, quality=90, optimize=True)
+        return path
+    except Exception as exc:
+        log.warning("custom game cover failed: %s", exc)
+        return None
+
+def render_custom_game_result_sync(game, username, won):
+    if not PIL_AVAILABLE:
+        return None
+    title = str(game.get("title") or game.get("command") or "لعبة")[:80]
+    result = "🎉 تم الفوز!" if won else "😔 حظاً سعيداً"
+    try:
+        bg = (18, 25, 38) if won else (35, 38, 48)
+        img = Image.new("RGB", (1000, 620), bg)
+        draw = ImageDraw.Draw(img)
+        font_big = None; font_mid = None
+        for fp in (str(BASE_DIR / "assets" / "Amiri-Bold.ttf"), "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+            try:
+                if Path(fp).is_file():
+                    font_big = ImageFont.truetype(fp, 58)
+                    font_mid = ImageFont.truetype(fp, 38)
+                    break
+            except Exception:
+                pass
+        font_big = font_big or ImageFont.load_default()
+        font_mid = font_mid or font_big
+        def centered(text, y, font):
+            shaped = shape_text(text)
+            box = draw.textbbox((0,0), shaped, font=font)
+            x = (1000 - (box[2]-box[0])) // 2
+            draw.text((x+3,y+3), shaped, font=font, fill=(0,0,0))
+            draw.text((x,y), shaped, font=font, fill=(255,255,255))
+        centered(title, 100, font_big)
+        centered(result, 245, font_mid)
+        centered("الفائز: @" + str(username) if won else "اللاعب: @" + str(username), 340, font_mid)
+        centered("Giant Chat", 500, font_mid)
+        outdir = BASE_DIR / "generated_games"
+        outdir.mkdir(exist_ok=True)
+        path = outdir / f"result_{_command_key(title).replace(' ','_')}_{uuid.uuid4().hex}.jpg"
+        img.save(path, quality=90, optimize=True)
+        return path
+    except Exception as exc:
+        log.warning("custom game result image failed: %s", exc)
+        return None
+
+async def send_custom_game_result(rid, game, username, won):
+    path = await asyncio.to_thread(render_custom_game_result_sync, game, username, won)
+    if path:
+        try:
+            url = await _store_media(path, "game", "image/jpeg")
+            await room_send_media(rid, "", url, m_type="image")
+            await broadcast_media(
+                f"🎮 {game.get('title', game.get('command','لعبة'))} — {'🎉 فاز' if won else '😔 لم يفز'} @{username}",
+                url, m_type="image", exclude_rid=rid
+            )
+        except Exception:
+            log.exception("failed to publish custom game result image")
+        finally:
+            try: path.unlink(missing_ok=True)
+            except Exception: pass
+
+async def execute_custom_command(rid, uid, username, text):
+    key = _command_key(text)
+    item = load_custom_commands().get(key)
+    if not item or not item.get("enabled", True):
+        return None
+    response = str(item.get("response") or "").strip()
+    response = response.replace("{user}", "@" + username).replace("{username}", username)
+    response = response.replace("{room}", str(rooms.get(rid, rid)))
+    if response.startswith("نشر:") or response.startswith("broadcast:"):
+        payload = response.split(":",1)[1].strip()
+        await broadcast_text(payload)
+        return "✅ تم تنفيذ الأمر ونشره في جميع الغرف."
+    if response.startswith("نقاط:"):
+        try: amount=int(re.search(r"-?\d+", response).group(0))
+        except Exception: amount=0
+        add_points(uid, username, amount)
+        return f"✅ تم تنفيذ الأمر. {'+' if amount >= 0 else ''}{amount} نقطة."
+    if response.startswith("خاص:"):
+        await dm_send(uid, response.split(":",1)[1].strip())
+        return "✅ تم تنفيذ الأمر وإرسال الرد في الخاص."
+    return response
+
 def load_testing_games():
     data = load_json(TESTING_GAMES_PATH, {})
     return data if isinstance(data, dict) else {}
@@ -2932,27 +3168,11 @@ def save_active_tests(data):
     Path(TESTING_STATE_PATH).parent.mkdir(parents=True, exist_ok=True)
     save_json(TESTING_STATE_PATH, data)
 
-def _resolve_testing_key(command, testing=None):
-    testing = testing if isinstance(testing, dict) else load_testing_games()
-    wanted = normalize_text(command).strip().lstrip("@")
-    if wanted in testing:
-        return wanted
-    # دعم اختلاف حالة الأحرف/المسافات وبعض النسخ التي حفظت الأمر مع @.
-    for key in testing:
-        clean = normalize_text(key).strip().lstrip("@")
-        if clean == wanted:
-            return key
-    # إذا كتب المالك اسم اللعبة بدل command، اسمح بالمطابقة مع title.
-    for key, item in testing.items():
-        if normalize_text(item.get("title", "")) == wanted:
-            return key
-    return wanted
-
 def activate_test_game(command):
+    key = normalize_text(command).strip()
     testing = load_testing_games()
-    key = _resolve_testing_key(command, testing)
     if key not in testing:
-        return False, f"❌ لا توجد لعبة اختبار باسم «{key}».\n🧪 اكتب «العاب الاختبار» لمعرفة الألعاب الموجودة فعلياً."
+        return False, f"❌ لا توجد لعبة اختبار باسم «{key}»."
     active = load_active_tests()
     active[key] = {"enabled": True, "activated_at": now_iso()}
     save_active_tests(active)
@@ -2960,12 +3180,8 @@ def activate_test_game(command):
     return True, f"🧪 تم تشغيل اختبار «{title}».\n🎮 اكتب «{key}» داخل أي غرفة لتجربتها.\n🔐 الاختبار متاح لصاحب البوت فقط."
 
 def deactivate_test_game(command):
+    key = normalize_text(command).strip()
     active = load_active_tests()
-    key = _resolve_testing_key(command)
-    if key not in active:
-        # جرّب المفاتيح المنسوخة مع اختلاف بسيط.
-        matched = next((k for k in active if normalize_text(k).lstrip("@") == normalize_text(command).lstrip("@")), None)
-        key = matched or key
     if key not in active:
         return False, f"ℹ️ لعبة «{key}» ليست في وضع الاختبار."
     active.pop(key, None)
@@ -2974,7 +3190,7 @@ def deactivate_test_game(command):
 
 def approve_testing_game(command):
     testing = load_testing_games()
-    key = _resolve_testing_key(command, testing)
+    key = str(command).strip().lower()
     item = testing.get(key)
     if not item:
         return False, f"❌ لا توجد لعبة اختبار باسم {key}."
@@ -2983,9 +3199,6 @@ def approve_testing_game(command):
     save_custom_games(approved)
     testing.pop(key, None)
     save_testing_games(testing)
-    active = load_active_tests()
-    active.pop(key, None)
-    save_active_tests(active)
     return True, f"✅ تم اعتماد اللعبة «{item.get('title', key)}» ونقلها من testing إلى approved."
 
 
@@ -3206,15 +3419,141 @@ async def generate_ai_image(prompt, filename_prefix="ai"):
     except Exception as exc:
         return None, f"❌ تعذر إنشاء البطاقة المحلية: {type(exc).__name__}: {exc}"
 
+
+# ----------------------------- مصمم الألعاب الذكي -----------------------------
+def load_game_design_state():
+    data = load_json(GAME_DESIGN_PATH, {})
+    return data if isinstance(data, dict) else {}
+
+def save_game_design_state(data):
+    Path(GAME_DESIGN_PATH).parent.mkdir(parents=True, exist_ok=True)
+    save_json(GAME_DESIGN_PATH, data)
+
+def clear_game_design(uid):
+    data = load_game_design_state(); data.pop(str(uid), None); save_game_design_state(data)
+
+def get_game_design(uid): return load_game_design_state().get(str(uid))
+def set_game_design(uid, state):
+    data=load_game_design_state(); data[str(uid)]=state; save_game_design_state(data)
+
+GAME_DESIGN_CATEGORIES={"1":"حظ وجوائز","2":"تحدي سرعة","3":"منافسة بين لاعبين","4":"تخمين وأسئلة","5":"لعبة جماعية","6":"كلمات وذكاء","7":"مغامرة ومفاجآت"}
+
+async def brainstorm_game_ideas(theme):
+    prompt=("أنت مصمم ألعاب لبوت دردشة عربي اسمه Giant Chat. "
+            "اقترح 3 أفكار ألعاب مختلفة وقابلة للتنفيذ في غرفة دردشة. "
+            f"التصنيف: {theme}. أعد JSON فقط بهذا الشكل: "
+            '{"ideas":[{"name":"...","summary":"...","players":"...","core":"..."}]}')
+    raw, err = await ai_response(prompt, 900)
+    if err:
+        return [{"name":"تحدي الحظ","summary":"نتيجة عشوائية مع جائزة.","players":"1","core":"احتمال فوز"},
+                {"name":"المواجهة","summary":"لاعبان يتنافسان.","players":"2","core":"مواجهة ثم فائز"},
+                {"name":"صندوق الأسرار","summary":"اختيار صندوق بمفاجأة.","players":"1","core":"صناديق وجائزة"}]
+    try:
+        m=re.search(r'\{.*\}', raw, re.S); obj=json.loads(m.group(0) if m else raw)
+        out=[]
+        for x in (obj.get('ideas') or [])[:3]:
+            if isinstance(x,dict): out.append({"name":str(x.get("name") or "لعبة جديدة")[:60],"summary":str(x.get("summary") or "")[:300],"players":str(x.get("players") or "1")[:30],"core":str(x.get("core") or "")[:300]})
+        return out or [{"name":"تحدي جديد","summary":"لعبة دردشة بسيطة.","players":"1","core":"نتيجة عشوائية"}]
+    except Exception: return [{"name":"تحدي جديد","summary":"لعبة دردشة بسيطة.","players":"1","core":"نتيجة عشوائية"}]
+
+async def make_game_spec_from_design(state):
+    idea=state.get("idea") or {}; theme=state.get("theme") or "متنوعة"
+    prompt=("حوّل فكرة اللعبة إلى تعريف جاهز لبوت Giant Chat. "
+            f"الفكرة: {idea.get('name')} — {idea.get('summary')} — {idea.get('core')}. "
+            f"التصنيف: {theme}. تفاصيل الماستر: {state.get('details','')}. "
+            "أعد JSON فقط بالمفاتيح command,title,win_chance,win_points,lose_points,win_message,lose_message,image_prompt. "
+            "command كلمة عربية قصيرة بدون مسافات. win_chance رقم 1-100. لا تستخدم كود أو HTML.")
+    raw, err=await ai_response(prompt,900)
+    if err:
+        name=idea.get('name') or 'لعبة جديدة'
+        return {"command":re.sub(r"[^\w\u0600-\u06ff-]","",name.replace(" ",""))[:24] or "لعبة","title":name,"win_chance":50,"win_points":50,"lose_points":0,"win_message":"🎉 فزت!","lose_message":"😔 حظاً سعيداً، حاول مرة أخرى.","image_prompt":f"غلاف لعبة {name} في Giant Chat"}
+    try:
+        m=re.search(r'\{.*\}',raw,re.S); obj=json.loads(m.group(0) if m else raw)
+        def aiint(v,d,lo=None,hi=None):
+            try:
+                if isinstance(v,(int,float)): n=int(v)
+                else:
+                    mm=re.search(r'-?\d+',str(v or '')); n=int(mm.group(0)) if mm else d
+            except Exception: n=d
+            if lo is not None: n=max(lo,n)
+            if hi is not None: n=min(hi,n)
+            return n
+        return {"command":re.sub(r"[^\w\u0600-\u06ff-]","",str(obj.get("command") or idea.get("name") or "لعبة").replace(" ",""))[:24].lower(),"title":str(obj.get("title") or idea.get("name") or "لعبة جديدة")[:80],"win_chance":aiint(obj.get("win_chance"),50,1,100),"win_points":aiint(obj.get("win_points"),50,-1000000,1000000),"lose_points":aiint(obj.get("lose_points"),0,-1000000,1000000),"win_message":str(obj.get("win_message") or "🎉 فوز!")[:200],"lose_message":str(obj.get("lose_message") or "😔 حظاً سعيداً")[:200],"image_prompt":str(obj.get("image_prompt") or "غلاف لعبة جديدة")[:1000]}
+    except Exception:
+        name=idea.get('name') or 'لعبة جديدة'
+        return {"command":re.sub(r"[^\w\u0600-\u06ff-]","",name.replace(" ",""))[:24] or "لعبة","title":name,"win_chance":50,"win_points":50,"lose_points":0,"win_message":"🎉 فوز!","lose_message":"😔 حظاً سعيداً","image_prompt":f"غلاف لعبة {name}"}
+
+async def finalize_designed_game(uid,spec):
+    command=spec.get("command") or "لعبة"; existing={}; existing.update(load_testing_games()); existing.update(load_custom_games()); base=command; n=2
+    while command in existing: command=(base+str(n))[:24]; n+=1
+    spec["command"]=command; spec["status"]="testing"; spec["created_at"]=now_iso(); spec["designer"]="master"
+    try:
+        cover=await asyncio.to_thread(render_custom_game_cover_sync,spec)
+        if cover: spec["image_url"]=await _store_media(cover,"game","image/jpeg"); cover.unlink(missing_ok=True)
+    except Exception as exc: spec["image_error"]=f"{type(exc).__name__}: {exc}"[:500]
+    testing=load_testing_games(); testing[command]=spec; save_testing_games(testing); clear_game_design(uid)
+    return (f"🧪 تم إنشاء اللعبة «{spec['title']}» في بيئة الاختبار.\n🎮 الأمر: {command}\n"
+            f"🎯 الفوز: {spec['win_chance']}% | 💰 الجائزة: {spec['win_points']} نقطة\n"
+            f"🖼️ الصورة: {'✅ جاهزة' if spec.get('image_url') else '⚠️ لم ترفع'}\n"
+            f"➡️ تشغيل الاختبار: تشغيل اختبار@{command}\n➡️ الاعتماد بعد النجاح: اعتماد لعبة {command}")
+
+async def handle_game_designer(sender,text):
+    low=normalize_text(text); state=get_game_design(sender)
+    if low in ("الغاء تصميم اللعبة","إلغاء تصميم اللعبة","الغاء اللعبة الجديدة","إلغاء"):
+        if state: clear_game_design(sender); return "🛑 تم إلغاء جلسة تصميم اللعبة."
+        return None
+    if not state and low in ("اخترع لعبة جديدة","إخترع لعبة جديدة","صمم لعبة جديدة","فكر معي لعبة","ابتكر لعبة جديدة"):
+        set_game_design(sender,{"stage":"category","created_at":now_iso()})
+        return "🧠 لنبتكر لعبة جديدة معاً. اختر النوع:\n1️⃣ حظ وجوائز\n2️⃣ تحدي سرعة\n3️⃣ منافسة بين لاعبين\n4️⃣ تخمين وأسئلة\n5️⃣ لعبة جماعية\n6️⃣ كلمات وذكاء\n7️⃣ مغامرة ومفاجآت\n💡 أو اكتب فكرتك مباشرة."
+    if not state: return None
+    stage=state.get("stage")
+    if stage=="category":
+        theme=GAME_DESIGN_CATEGORIES.get(low.strip(),str(text).strip()[:100]); ideas=await brainstorm_game_ideas(theme); state.update({"stage":"idea","theme":theme,"ideas":ideas}); set_game_design(sender,state)
+        return "🧠 التصنيف: "+theme+"\n"+"\n".join(f"{i}️⃣ {x['name']} — {x['summary']}" for i,x in enumerate(ideas,1))+"\n✏️ أو اكتب فكرتك بنفسك."
+    if stage=="idea":
+        ideas=state.get("ideas") or []; chosen=ideas[int(low)-1] if low.isdigit() and 1<=int(low)<=len(ideas) else {"name":str(text).strip()[:60],"summary":"فكرة الماستر","players":"1","core":str(text).strip()[:300]}
+        state.update({"stage":"details","idea":chosen}); set_game_design(sender,state)
+        return f"🎮 الفكرة: {chosen['name']}\n📝 {chosen['summary']}\n\nأعطني التفاصيل: عدد اللاعبين، المهلة، الجائزة، طريقة الفوز... أو اكتب «نفذها»."
+    if stage=="details":
+        state["details"]="إعدادات مناسبة ومتوازنة." if low in ("نفذها","نفذ","أنشئها","انشئها") else str(text).strip()[:1000]
+        spec=await make_game_spec_from_design(state); state.update({"stage":"confirm","draft":spec}); set_game_design(sender,state)
+        return (f"📝 مسودة اللعبة:\n🎮 {spec['title']}\n🔤 الأمر: {spec['command']}\n🎯 الفوز: {spec['win_chance']}%\n💰 الجائزة: {spec['win_points']} نقطة\n📉 الخسارة: {spec['lose_points']} نقطة\n\n✅ اكتب «اعتمد التصميم» لإنشائها في testing.\n✏️ اكتب «عدل ...» للتعديل.\n🛑 الغاء تصميم اللعبة للإلغاء.")
+    if stage=="confirm":
+        if low in ("اعتمد التصميم","اعتمد اللعبة","نفذها","نفذ","انشئ اللعبة","أنشئ اللعبة"): return await finalize_designed_game(sender,state.get("draft") or {})
+        if low.startswith("عدل "):
+            state["stage"]="details"; state["details"]=text.split(None,1)[1].strip()[:1000]; set_game_design(sender,state); return "✏️ تم تسجيل التعديل. أرسل «نفذها»."
+        return "⏳ أنت في مرحلة المراجعة. اكتب «اعتمد التصميم» أو «عدل ...»."
+    return None
+
 async def add_ai_game(uid, description):
     if not description:
         return "❌ الصيغة: اضف لعبة اسم_اللعبة | وصف اللعبة"
     parts = [x.strip() for x in description.split("|", 1)]
     name = parts[0][:40]
     desc = parts[1][:800] if len(parts) > 1 else name
-    prompt = f"""أنشئ تعريف لعبة نصية بسيطة وآمنة لبوت دردشة. اسم اللعبة: {name}. الوصف: {desc}. أعد JSON فقط بالمفاتيح: command,title,win_chance,win_points,lose_points,win_message,lose_message,image_prompt. command كلمة عربية قصيرة بدون مسافات. win_chance رقم 1-100، النقاط أرقام صحيحة بين -1000 و1000. لا تضع HTML أو كود Python أو أوامر نظام."""
+
+    # منع إنشاء نفس اللعبة مرة أخرى كلما أرسل الماستر أمر الإضافة.
+    requested_key = re.sub(r"[^\w\u0600-\u06ff-]", "", name.replace(" ", ""))[:24].lower()
+    existing = {}
+    existing.update(load_testing_games())
+    existing.update(load_custom_games())
+    if requested_key and requested_key in existing:
+        old_game = existing[requested_key]
+        return (f"ℹ️ اللعبة «{old_game.get('title', name)}» موجودة بالفعل.\n"
+                f"🎮 الأمر: {requested_key}\n"
+                f"📌 الحالة: {old_game.get('status', 'موجودة')}\n"
+                "🚫 لن أنشئ نسخة ثانية ولن أكرر إضافة الجوائز.")
+
+    prompt = f"""أنشئ تعريف لعبة نصية بسيطة وآمنة لبوت دردشة. اسم اللعبة: {name}. الوصف: {desc}. أعد JSON فقط بالمفاتيح: command,title,win_chance,win_points,lose_points,win_message,lose_message,image_prompt. command كلمة عربية قصيرة بدون مسافات. win_chance رقم 1-100 (لا تجعله 100 إلا إذا طلب المالك ذلك صراحة)، والنقاط أرقام صحيحة. لا تضع HTML أو كود Python أو أوامر نظام."""
     raw, err = await ai_response(prompt, 900)
-    if err: return err
+    # إذا تعذر تحميل الذكاء المحلي، لا يتوقف نظام إضافة الألعاب؛ نستخدم تعريفاً آمناً افتراضياً.
+    if err:
+        raw = json.dumps({
+            "command": re.sub(r"[^\w\u0600-\u06ff-]", "", name.replace(" ", ""))[:24] or "لعبة",
+            "title": name, "win_chance": 50, "win_points": 20, "lose_points": -5,
+            "win_message": "🎉 تم الفوز!", "lose_message": "😔 حظاً سعيداً، جرب مرة أخرى.",
+            "image_prompt": f"بطاقة لعبة {name} في Giant Chat"
+        }, ensure_ascii=False)
     try:
         match = re.search(r"\{.*\}", raw, re.S)
         data = json.loads(match.group(0) if match else raw)
@@ -3234,37 +3573,43 @@ async def add_ai_game(uid, description):
         data = {
             "command": command, "title": str(data.get("title") or name)[:80],
             "win_chance": _ai_int(data.get("win_chance", 50), 50, 1, 100),
-            "win_points": _ai_int(data.get("win_points", 20), 20, -1000, 1000),
-            "lose_points": _ai_int(data.get("lose_points", -5), -5, -1000, 1000),
+            "win_points": _ai_int(data.get("win_points", 20), 20, -1000000, 1000000),
+            "lose_points": _ai_int(data.get("lose_points", -5), -5, -1000000, 1000000),
             "win_message": str(data.get("win_message") or "🎉 فوز!")[:200],
             "lose_message": str(data.get("lose_message") or "😅 خسارة!")[:200],
-            "image_prompt": str(data.get("image_prompt") or f"Game card for {name}, no text")[:1000],
+            "image_prompt": str(data.get("image_prompt") or f"بطاقة لعبة {name} في Giant Chat")[:1000],
         }
-        # أنشئ صورة حقيقية للعبة واحفظ رابطها، حتى تعمل أثناء testing ثم تنتقل مع اللعبة عند الاعتماد.
-        try:
-            image_path, image_err = await generate_ai_image(data["image_prompt"], f"game_{command}")
-            if image_path and not image_err:
-                data["image_url"] = await _store_media(image_path, "game", "image/jpeg")
-                try:
-                    image_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            else:
-                data["image_url"] = None
-                if image_err:
-                    log.warning("AI game image generation failed: %s", image_err)
-        except Exception as image_exc:
-            data["image_url"] = None
-            log.warning("AI game image storage failed: %s", image_exc)
+
+        # لعبة «مليون»: المليون جائزة الفوز فقط، وليس جائزة مضمونة كل مرة.
+        # النتيجة عشوائية بنسبة 50% ما لم يطلب الماستر نسبة أخرى صراحة.
+        if normalize_text(name) == "مليون" or command == "مليون":
+            data["title"] = "مليون"
+            data["win_chance"] = 50
+            data["win_points"] = 1000000
+            data["lose_points"] = 0
+            data["win_message"] = "🎉 تم الحصول على مليون!"
+            data["lose_message"] = "😔 حظًا سعيدًا، جرب في المرة القادمة."
+            data["image_prompt"] = "بطاقة لعبة مليون فاخرة، رقم 1,000,000، أسلوب ألعاب دردشة، بدون كتابة اسم اللاعب"
         # ضع اللعبة في بيئة الاختبار فقط، وليس custom_games.json.
         testing = load_testing_games()
         data["status"] = "testing"
         data["created_at"] = now_iso()
+        # صورة غلاف خاصة باللعبة تُحفظ في public game storage.
+        try:
+            cover = await asyncio.to_thread(render_custom_game_cover_sync, data)
+            if cover:
+                data["image_url"] = await _store_media(cover, "game", "image/jpeg")
+                cover.unlink(missing_ok=True)
+        except Exception as cover_exc:
+            # لا نفشل إنشاء اللعبة بسبب الصورة، لكن نسجل السبب لكي يمكن إصلاحه.
+            data["image_error"] = f"{type(cover_exc).__name__}: {cover_exc}"[:500]
+            log.warning("game cover creation skipped: %s", cover_exc)
         testing[command] = data
         save_testing_games(testing)
         return (f"🧪 تم إنشاء اللعبة «{data['title']}» في بيئة الاختبار.\n"
                 f"🎮 الأمر: {command}\n"
                 f"🧪 الحالة: testing\n"
+                f"🖼️ صورة اللعبة: {'✅ جاهزة' if data.get('image_url') else '⚠️ لم تُرفع — راجع PUBLIC_BASE_URL/Storage'}\n"
                 f"➡️ لتجربتها: تشغيل اختبار@{command}\n"
                 f"➡️ بعد نجاح الاختبار: اعتماد لعبة {command}\n"
                 f"ℹ️ لا تعمل في الغرف قبل تشغيل وضع الاختبار أو اعتمادها.")
@@ -3275,10 +3620,131 @@ async def add_ai_game(uid, description):
         except Exception: log.exception("تعذر إرسال خطأ إنشاء اللعبة إلى المالك في الخاص")
         return "❌ تعذر اعتماد تعريف اللعبة من الذكاء الاصطناعي. تم إرسال تفاصيل الخطأ إلى المالك في الخاص."
 
+def _repair_json_file(path, default):
+    p = Path(path)
+    if not p.exists():
+        save_json(str(p), default)
+        return "created"
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            json.load(f)
+        return "ok"
+    except Exception:
+        try:
+            backup = p.with_suffix(p.suffix + f".broken.{int(time.time())}")
+            shutil.copy2(p, backup)
+        except Exception:
+            pass
+        save_json(str(p), default)
+        return "repaired"
+
+def self_repair_sync():
+    results=[]
+    for path, default in [
+        (CONFIG_PATH, dict(C)), (POINTS_PATH, {}), (REPLIES_PATH, {}), (MASTERS_PATH, []),
+        (BANS_PATH, {}), (ROOMS_PATH, {}), (MODERATION_PATH, {"enabled":{},"words":[]}),
+        (WELCOME_PATH, {}), (PUBLISHED_POSTS_PATH, {}), (SOCIAL_EVENTS_PATH, {}),
+        (VIP_USERS_PATH, {}), (CUSTOM_GAMES_PATH, {}), (CUSTOM_COMMANDS_PATH, {}),
+        (TESTING_GAMES_PATH, {}), (TESTING_STATE_PATH, {}),
+    ]:
+        try:
+            state=_repair_json_file(path, default)
+            if state != "ok": results.append(f"{Path(path).name}: {state}")
+        except Exception as exc:
+            results.append(f"{Path(path).name}: failed {type(exc).__name__}")
+    for d in ["logs", "generated_games", "generated_music", "published_media", "games/testing", "games/approved"]:
+        try:
+            Path(BASE_DIR / d).mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            results.append(f"dir {d}: failed {type(exc).__name__}")
+    active=load_active_tests(); testing=load_testing_games()
+    stale=[k for k in active if k not in testing]
+    if stale:
+        for k in stale: active.pop(k,None)
+        save_active_tests(active); results.append("removed stale tests")
+    compile_ok=True; compile_error=""
+    try:
+        compile(Path(__file__).read_text(encoding="utf-8"), str(Path(__file__)))
+    except Exception as exc:
+        compile_ok=False; compile_error=f"{type(exc).__name__}: {exc}"
+    return results, compile_ok, compile_error
+
+async def delete_game_definition(command):
+    key=normalize_text(command).strip()
+    removed=[]
+    testing=load_testing_games(); active=load_active_tests(); approved=load_custom_games()
+    if key in testing:
+        testing.pop(key,None); removed.append("testing")
+    if key in active:
+        active.pop(key,None); removed.append("active")
+    if key in approved:
+        approved.pop(key,None); removed.append("approved")
+    save_testing_games(testing); save_active_tests(active); save_custom_games(approved)
+    try:
+        Path(APPROVED_GAMES_DIR, f"{key}.json").unlink(missing_ok=True)
+    except Exception: pass
+    return removed
+
 async def handle_ai_dm(sender, text):
     if (await username_of(sender)).lower() != OWNER:
         return "🚫 نظام الصيانة والذكاء الاصطناعي متاح لصاحب البوت فقط."
     low = normalize_text(text)
+    designer_reply = await handle_game_designer(sender, text)
+    if designer_reply is not None:
+        return designer_reply
+
+    if low in ("اصلاح ذاتيا", "إصلاح ذاتياً", "إصلاح ذاتيا", "اصلاح البوت", "إصلاح البوت", "صيانة ذاتية"):
+        results, compile_ok, compile_error = await asyncio.to_thread(self_repair_sync)
+        msg = "🛠️ الإصلاح الذاتي اكتمل.\n"
+        msg += "• Python: " + ("✅ سليم" if compile_ok else "❌ " + compile_error) + "\n"
+        msg += "• البيانات/المجلدات: " + ("لا تحتاج إصلاحاً." if not results else "\n  • " + "\n  • ".join(results))
+        return msg
+
+    if low in ("حالة البوت", "حاله البوت", "bot status", "status"):
+        age = int(max(0, time.time() - BOT_STARTED_AT))
+        hb = int(max(0, time.time() - LAST_HEARTBEAT_AT)) if LAST_HEARTBEAT_AT else None
+        return (f"🤖 حالة البوت الآن\n🟢 العملية: تعمل\n🌐 الشبكة: {'🟢 متصلة' if NETWORK_ONLINE else '🔴 منقطعة'}\n"
+                f"🏠 الغرف: {len(rooms)}\n💓 آخر heartbeat: {hb if hb is not None else '—'} ثانية\n⏱️ مدة التشغيل: {age} ثانية")
+
+    if low in ("الاوامر المضافة", "الأوامر المضافة", "اوامر مضافة", "custom commands"):
+        cmds=load_custom_commands()
+        if not cmds: return "📭 لا توجد أوامر مضافة حالياً."
+        return "🧩 الأوامر المضافة:\n" + "\n".join(f"• {k} — {'🟢' if v.get('enabled',True) else '🔴'} {v.get('response','')[:80]}" for k,v in cmds.items())
+
+    if low.startswith("اضف امر ") or low.startswith("أضف أمر ") or low.startswith("اضف أمر "):
+        body=text.split(None,2)[2].strip() if len(text.split(None,2))>2 else ""
+        parts=[x.strip() for x in body.split("|",1)]
+        if len(parts)!=2: return "❌ الصيغة: اضف امر اسم_الامر | الرد\n💡 يدعم {user} و{username} و{room}."
+        try:
+            item=add_custom_command_definition(parts[0], parts[1])
+            return f"✅ تمت إضافة الأمر «{item['command']}».\n🎯 عند كتابته في الغرفة سينفذ الرد مباشرة."
+        except Exception as exc:
+            return f"❌ تعذر إضافة الأمر: {exc}"
+
+    if low.startswith("حذف امر ") or low.startswith("احذف امر ") or low.startswith("حذف أمر ") or low.startswith("احذف أمر "):
+        body=text.split(None,2)[2].strip() if len(text.split(None,2))>2 else ""
+        removed=delete_custom_command_definition(body)
+        return f"🗑️ تم حذف الأمر «{_command_key(body)}»." if removed else f"ℹ️ لا يوجد أمر مضاف باسم «{_command_key(body)}»."
+
+    if low.startswith("تعطيل امر ") or low.startswith("تعطيل أمر "):
+        body=text.split(None,2)[2].strip() if len(text.split(None,2))>2 else ""
+        key=_command_key(body); cmds=load_custom_commands()
+        if key not in cmds: return f"❌ الأمر «{key}» غير موجود."
+        cmds[key]["enabled"]=False; cmds[key]["updated_at"]=now_iso(); save_custom_commands(cmds)
+        return f"⏸️ تم تعطيل الأمر «{key}»."
+
+    if low.startswith("تفعيل امر ") or low.startswith("تفعيل أمر "):
+        body=text.split(None,2)[2].strip() if len(text.split(None,2))>2 else ""
+        key=_command_key(body); cmds=load_custom_commands()
+        if key not in cmds: return f"❌ الأمر «{key}» غير موجود."
+        cmds[key]["enabled"]=True; cmds[key]["updated_at"]=now_iso(); save_custom_commands(cmds)
+        return f"▶️ تم تفعيل الأمر «{key}»."
+
+    if low.startswith("حذف لعبة ") or low.startswith("احذف لعبة ") or low.startswith("حذف لعبه ") or low.startswith("احذف لعبه "):
+        body=text.split(None,2)[2].strip() if len(text.split(None,2))>2 else ""
+        removed=await delete_game_definition(body)
+        return f"🗑️ تم حذف اللعبة «{normalize_text(body)}» من: {', '.join(removed)}." if removed else f"ℹ️ اللعبة «{normalize_text(body)}» غير موجودة."
+
     if low in ("اصلاح", "إصلاح", "ai", "ذكاء"):
         return ("🛠️ مركز إصلاح البوت بالذكاء الاصطناعي\n"
                 "━━━━━━━━━━━━━━\n"
@@ -3289,8 +3755,8 @@ async def handle_ai_dm(sender, text):
                 "5️⃣ اصلاح سجل — عرض آخر أخطاء السجل\n"
                 "6️⃣ اصلاح ذكي مشكلة — تحليل المشكلة بالذكاء الاصطناعي\n"
                 "7️⃣ صمم وصف — إنشاء صورة بالذكاء الاصطناعي وإضافتها للوسائط\n"
-                "8️⃣ اضف لعبة اسم | وصف — إنشاء لعبة في testing (لا تُشغّل حتى اعتمادها)\n"
-                "9️⃣ اعتماد لعبة command — نقل اللعبة المعتمدة إلى التشغيل\n🧪 تشغيل اختبار@command — تشغيل لعبة testing للاختبار داخل الغرف للمالك فقط\n🧪 إيقاف اختبار@command — إيقاف اختبار اللعبة\n🧪 حالة اختبار@command — حالة لعبة الاختبار\n🧪 اختبارات نشطة — عرض الاختبارات الحالية\n"
+                "8️⃣ اضف لعبة اسم | وصف — إنشاء لعبة في testing\n"                "🧠 اخترع لعبة جديدة — ابتكار لعبة مع الماستر خطوة بخطوة\n"                "✏️ عدّل التصميم — تعديل مسودة اللعبة\n"                "🛑 الغاء تصميم اللعبة — إلغاء جلسة التصميم\n"
+                "9️⃣ اعتماد لعبة command — نقل اللعبة المعتمدة إلى التشغيل\n🔟 حذف لعبة command — حذف اللعبة من testing/active/approved\n🧩 اضف امر اسم | رد — إضافة أمر ديناميكي بدون تعديل الكود\n🗑️ حذف امر اسم — حذف الأمر\n⏸️ تعطيل امر اسم / ▶️ تفعيل امر اسم\n📋 الأوامر المضافة — عرض الأوامر الديناميكية\n🛠️ اصلاح ذاتيا — إصلاح ملفات البيانات والمجلدات وفحص الكود\n🤖 حالة البوت — حالة التشغيل والاتصال الحالية\n🧪 تشغيل اختبار@command — تشغيل لعبة testing للاختبار\n🧪 إيقاف اختبار@command — إيقاف اختبار اللعبة\n🧪 حالة اختبار@command — حالة لعبة الاختبار\n🧪 اختبارات نشطة — عرض الاختبارات الحالية\n"
                 "🔐 تشغيل التوثيق / إيقاف التوثيق / حالة التوثيق\n"
                 "━━━━━━━━━━━━━━\n"
                 "🔐 كل هذه الأوامر خاصة بالمالك.")
@@ -3302,25 +3768,21 @@ async def handle_ai_dm(sender, text):
         return "🔓 تم إيقاف توثيق الحسابات. أصبحت الخدمات المحمية متاحة للجميع."
     if low in ("حالة التوثيق", "verification status"):
         return f"🔐 توثيق الحسابات: {'مفعّل' if VERIFICATION_ENABLED else 'متوقف'}"
-    # أوامر الاختبار تقبل جميع الصيغ الشائعة: تشغيل اختبار@x / تشغيل اختبار x / اختبار@x.
-    m_test = re.match(r"^(?:تشغيل\s+)?(?:اختبار|الاختبار)\s*@?\s*(.+)$", low)
-    if m_test:
-        command = m_test.group(1).strip()
-        if command:
-            ok, msg = activate_test_game(command)
-            return msg
-    m_stop = re.match(r"^(?:إيقاف|ايقاف|تعطيل)\s+(?:اختبار|الاختبار)\s*@?\s*(.+)$", low)
-    if m_stop:
-        ok, msg = deactivate_test_game(m_stop.group(1).strip())
+    if low.startswith("تشغيل اختبار@") or low.startswith("تشغيل اختبار "):
+        command = text.split("@", 1)[1].strip() if "@" in text else text.split(None, 2)[2].strip()
+        ok, msg = activate_test_game(command)
         return msg
-    m_status = re.match(r"^حالة\s+(?:اختبار|الاختبار)\s*@?\s*(.+)$", low)
-    if m_status:
-        command = m_status.group(1).strip()
-        testing = load_testing_games()
-        key = _resolve_testing_key(command, testing)
+    if low.startswith("إيقاف اختبار@") or low.startswith("ايقاف اختبار@") or low.startswith("إيقاف اختبار ") or low.startswith("ايقاف اختبار "):
+        command = text.split("@", 1)[1].strip() if "@" in text else text.split(None, 2)[2].strip()
+        ok, msg = deactivate_test_game(command)
+        return msg
+    if low.startswith("حالة اختبار@") or low.startswith("حالة اختبار "):
+        command = text.split("@", 1)[1].strip() if "@" in text else text.split(None, 2)[2].strip()
+        key = normalize_text(command).strip()
         active = load_active_tests()
+        testing = load_testing_games()
         if key not in testing:
-            return f"❌ لا توجد لعبة اختبار باسم «{key}».\n🧪 اكتب «العاب الاختبار» لمعرفة القائمة."
+            return f"❌ لا توجد لعبة اختبار باسم «{key}»."
         return f"🧪 لعبة الاختبار: {testing[key].get('title', key)}\n🎮 الأمر: {key}\n📌 الحالة: {'🟢 تعمل للاختبار' if key in active else '🔴 متوقفة'}"
     if low in ("اختبارات نشطة", "الاختبارات النشطة", "active tests"):
         active = load_active_tests()
@@ -3371,6 +3833,27 @@ async def dm_loop():
                     low = normalize_text(text)
                     is_owner = (await username_of(sender)).lower() == OWNER
                     reply = ""
+                    # رد فوري + مؤشر تقدم للماستر أثناء الأوامر البطيئة.
+                    master_like = is_owner and bool(text)
+                    progress_task = None
+                    progress_stop = None
+                    started_at = time.time()
+                    if master_like:
+                        try:
+                            await dm_send(sender, "⏳ جاري تلبية طلبك... انتظرني، سأرسل لك النتيجة بعد التنفيذ.")
+                            progress_stop = asyncio.Event()
+                            async def _master_progress():
+                                await asyncio.sleep(5)
+                                while not progress_stop.is_set():
+                                    elapsed = int(time.time() - started_at)
+                                    await dm_send(sender, f"⏳ ما زلت أنفذ طلبك... مضى {elapsed} ثانية.")
+                                    try:
+                                        await asyncio.wait_for(progress_stop.wait(), timeout=5)
+                                    except asyncio.TimeoutError:
+                                        continue
+                            progress_task = asyncio.create_task(_master_progress(), name="master-command-progress")
+                        except Exception:
+                            log.exception("failed to start master progress reporter")
                     if cmd in ("دخول", "join") and is_owner:
                         ok, m = await join(arg); reply = ("✅ " if ok else "❌ ") + m
                     elif cmd in ("خروج", "leave") and is_owner:
@@ -3392,10 +3875,20 @@ async def dm_loop():
                                  "العاب الاختبار — عرض ألعاب الاختبار\n"
                                  "غرفي — عرض الغرف المتصلة\n"
                                  "دخول اسم / خروج اسم — إدارة الغرف")
-                    elif text and is_owner:
-                        # أي رسالة من المالك في الخاص تمر أولاً على مركز الصيانة؛
-                        # هذا يجعل أوامر الاختبار والتوثيق والإصلاح قابلة للاكتشاف حتى لو اختلفت الصيغة.
+                    elif text and (cmd in ("اصلاح", "إصلاح", "ذكاء", "ai", "صمم", "اضف", "أضف", "اعتماد", "اعتمد", "تشغيل", "إيقاف", "ايقاف", "حذف", "احذف", "تعطيل", "تفعيل", "حالة", "الأوامر", "الاوامر") or low.startswith(("اصلاح ", "إصلاح ", "صمم ", "اضف لعبة ", "أضف لعبة ", "اضف امر ", "أضف أمر ", "اضف أمر ", "حذف لعبة ", "احذف لعبة ", "حذف لعبه ", "احذف لعبه ", "حذف امر ", "احذف امر ", "حذف أمر ", "احذف أمر ", "تعطيل امر ", "تعطيل أمر ", "تفعيل امر ", "تفعيل أمر ", "اعتماد لعبة ", "اعتمد لعبة ", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق", "حالة التوثيق", "اصلاح ذاتيا", "إصلاح ذاتياً", "حالة البوت", "الأوامر المضافة", "الاوامر المضافة"))):
                         reply = await handle_ai_dm(sender, text)
+                    elif is_owner and text:
+                        reply = "ℹ️ استلمت أمرك، لكن الأمر غير معروف. اكتب «أوامر الماستر» لرؤية الأوامر المتاحة."
+                    if progress_stop is not None:
+                        progress_stop.set()
+                    if progress_task is not None:
+                        progress_task.cancel()
+                        try:
+                            await progress_task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            log.exception("master progress reporter failed")
                     if reply: await dm_send(sender, reply)
                 await run(lambda i=row["id"]: sb.table("dm_relay").delete().eq("id", i).execute())
         except Exception:
@@ -3424,10 +3917,14 @@ async def room_loop():
 
 
 async def heartbeat_loop():
+    global LAST_HEARTBEAT_AT, LAST_DB_OK_AT
     while True:
         now = time.time()
         for rid in list(rooms):
-            await rpc("room_heartbeat", {"_room": rid})
+            data, err = await rpc("room_heartbeat", {"_room": rid})
+            if not err:
+                LAST_DB_OK_AT = time.time()
+        LAST_HEARTBEAT_AT = time.time()
         game = war_games.get(GLOBAL_WAR_KEY)
         if game and now >= game.get("expires_at", 0):
             war_games.pop(GLOBAL_WAR_KEY, None)
@@ -3470,6 +3967,7 @@ async def restore_saved_rooms():
             log.exception("rejoin room failed: %s", name)
 
 async def network_loop():
+    global NETWORK_ONLINE
     online = True
     while True:
         try:
@@ -3478,6 +3976,7 @@ async def network_loop():
                 ok = resp.status < 500
         except Exception:
             ok = False
+        NETWORK_ONLINE = ok
         if online and not ok:
             log.warning("Internet disconnected: leaving all bot rooms")
             await leave_all_for_disconnect()
@@ -3493,6 +3992,10 @@ async def main():
     http = aiohttp.ClientSession()
     try:
         await start_media_server()
+        try:
+            await asyncio.to_thread(self_repair_sync)
+        except Exception:
+            log.exception("startup self-repair failed")
         email = await resolve_email()
         res, err = await run(lambda: sb.auth.sign_in_with_password({"email": email, "password": PASSWORD}))
         if err or not res.user: raise RuntimeError("فشل الدخول")
