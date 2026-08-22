@@ -29,6 +29,12 @@ import aiohttp
 from aiohttp import web
 import requests
 
+# محرك الألعاب متعدد الأنواع (حظ، أسئلة، تخمين، سرعة، مواجهة...)
+try:
+    import game_engine
+except Exception:  # pragma: no cover
+    game_engine = None
+
 # ----------------------------- الذكاء الاصطناعي المحلي -----------------------------
 # لا يستخدم OpenAI ولا يحتاج إلى مفتاح API.
 try:
@@ -2264,6 +2270,18 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     p_name = await username_of(uid)
     lower_text = text.strip().lower()
 
+    # جولة لعبة تفاعلية جارية في الغرفة (أسئلة، تخمين، سرعة، مواجهة...)
+    if game_engine is not None and text:
+        try:
+            engine_result = game_engine.handle_message(rid, uid, p_name, text)
+        except Exception:
+            log.exception("game engine failed")
+            engine_result = None
+        if engine_result:
+            engine_text = await apply_game_engine_result(rid, engine_result)
+            if engine_text:
+                return engine_text
+
     social_reply = await handle_social_reaction(rid, text, uid, p_name)
     if social_reply is not None:
         return social_reply
@@ -2805,30 +2823,11 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if cmd in active_tests and cmd in testing_games:
         if not await is_master(uid, p_name):
             return "🔐 لعبة الاختبار متاحة للمالك/الماستر فقط."
-        custom = testing_games[cmd]
+        custom = dict(testing_games[cmd], command=cmd)
         cd_error = await require_game_cooldown(cmd)
         if cd_error:
             return cd_error
-        await room_send(rid, f"🔎 جاري البحث عن {custom.get('title', cmd)}...")
-        await asyncio.sleep(0.5)
-        try:
-            win_chance = max(1, min(100, int(custom.get("win_chance", 50))))
-        except Exception:
-            win_chance = 50
-        win = random.randint(1, 100) <= win_chance
-        try:
-            delta = int(custom.get("win_points", 20)) if win else int(custom.get("lose_points", -5))
-        except Exception:
-            delta = 20 if win else -5
-        add_points(uid, p_name, delta)
-        if custom.get("image_url"):
-            try:
-                await room_send_media(rid, "", custom.get("image_url"), m_type="image")
-            except Exception:
-                pass
-        await send_custom_game_result(rid, custom, p_name, win)
-        msg = custom.get("win_message") if win else custom.get("lose_message")
-        return f"🧪 اختبار: {msg or ('🎉 فوز!' if win else '😅 خسارة!')} @{p_name}\n💰 {'+' if delta >= 0 else ''}{delta} نقطة"
+        return await run_custom_game(rid, uid, p_name, custom, testing=True)
 
     custom_games = load_custom_games()
     custom = custom_games.get(cmd)
@@ -2839,19 +2838,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         cd_error = await require_game_cooldown(cmd)
         if cd_error:
             return cd_error
-        await room_send(rid, f"🔎 جاري البحث عن {custom.get('title', cmd)}...")
-        await asyncio.sleep(0.5)
-        win = random.randint(1, 100) <= int(custom.get("win_chance", 50))
-        delta = int(custom.get("win_points", 20)) if win else int(custom.get("lose_points", -5))
-        add_points(uid, p_name, delta)
-        if custom.get("image_url"):
-            try:
-                await room_send_media(rid, "", custom.get("image_url"), m_type="image")
-            except Exception:
-                pass
-        await send_custom_game_result(rid, custom, p_name, win)
-        msg = custom.get("win_message") if win else custom.get("lose_message")
-        return f"{msg} @{p_name}\n💰 {'+' if delta >= 0 else ''}{delta} نقطة"
+        return await run_custom_game(rid, uid, p_name, dict(custom, command=cmd), testing=False)
 
     if cmd in games_map:
         cd_error = await require_game_cooldown(cmd)
@@ -3031,6 +3018,62 @@ async def send_custom_game_result(rid, game, username, won):
         finally:
             try: path.unlink(missing_ok=True)
             except Exception: pass
+
+async def apply_game_engine_result(rid, result):
+    """يطبق نتيجة محرك الألعاب: النقاط + نص الرد."""
+    if not result:
+        return None
+    for key in ("winner", "loser"):
+        entry = result.get(key)
+        if entry:
+            w_uid, w_name, delta = entry
+            try:
+                add_points(w_uid, w_name, int(delta))
+            except Exception:
+                log.exception("failed to apply game points")
+    return result.get("text")
+
+
+async def run_custom_game(rid, uid, p_name, custom, testing=False):
+    """يشغّل لعبة مخصّصة حسب نوعها (حظ فوري أو جولة تفاعلية)."""
+    title = custom.get("title", custom.get("command", "لعبة"))
+    prefix = "🧪 اختبار: " if testing else ""
+    gtype = game_engine.game_type_of(custom) if game_engine else "chance"
+
+    if game_engine and gtype != "chance":
+        active = game_engine.get_session(rid)
+        if active:
+            return f"⏳ توجد جولة «{active['game'].get('title', active.get('command'))}» جارية في الغرفة. انتظر انتهاءها."
+        intro, _session = game_engine.start_session(rid, custom, uid, p_name)
+        if intro:
+            if custom.get("image_url"):
+                try:
+                    await room_send_media(rid, "", custom.get("image_url"), m_type="image")
+                except Exception:
+                    log.exception("failed to send game cover")
+            return prefix + intro
+
+    await room_send(rid, f"🔎 جاري البحث عن {title}...")
+    await asyncio.sleep(0.5)
+    try:
+        win_chance = max(1, min(100, int(custom.get("win_chance", 50))))
+    except Exception:
+        win_chance = 50
+    win = random.randint(1, 100) <= win_chance
+    try:
+        delta = int(custom.get("win_points", 20)) if win else int(custom.get("lose_points", -5))
+    except Exception:
+        delta = 20 if win else -5
+    add_points(uid, p_name, delta)
+    if custom.get("image_url"):
+        try:
+            await room_send_media(rid, "", custom.get("image_url"), m_type="image")
+        except Exception:
+            log.exception("failed to send game cover")
+    await send_custom_game_result(rid, custom, p_name, win)
+    msg = custom.get("win_message") if win else custom.get("lose_message")
+    return f"{prefix}{msg or ('🎉 فوز!' if win else '😅 خسارة!')} @{p_name}\n💰 {'+' if delta >= 0 else ''}{delta} نقطة"
+
 
 async def execute_custom_command(rid, uid, username, text):
     key = _command_key(text)
@@ -3358,32 +3401,116 @@ async def brainstorm_game_ideas(theme):
         return out or [{"name":"تحدي جديد","summary":"لعبة دردشة بسيطة.","players":"1","core":"نتيجة عشوائية"}]
     except Exception: return [{"name":"تحدي جديد","summary":"لعبة دردشة بسيطة.","players":"1","core":"نتيجة عشوائية"}]
 
+GAME_TYPE_HINTS = {
+    "chance": "حظ فوري: نتيجة عشوائية مع نسبة فوز.",
+    "quiz": "سؤال وجواب: أول من يجيب صحيحاً يفوز.",
+    "math": "مسألة حسابية سريعة.",
+    "guess": "تخمين رقم سري مع تلميحات.",
+    "fastest": "أسرع من يكتب الكلمة المعروضة.",
+    "word": "ترتيب حروف كلمة مبعثرة.",
+    "duel": "مواجهة بين لاعبين، من ينضم يواجه صاحب التحدي.",
+}
+
+
+def _spec_defaults(gtype, name):
+    spec = {
+        "command": re.sub(r"[^\w\u0600-\u06ff-]", "", str(name).replace(" ", ""))[:24].lower() or "لعبه",
+        "title": str(name)[:80],
+        "game_type": gtype,
+        "win_chance": 50,
+        "win_points": 50,
+        "lose_points": 0,
+        "timeout_seconds": 60,
+        "win_message": "🎉 فوز رائع!",
+        "lose_message": "😔 حظاً أوفر في الجولة القادمة.",
+        "image_prompt": f"غلاف لعبة {name} لبوت دردشة عربي",
+    }
+    if gtype == "quiz":
+        spec["questions"] = [
+            {"q": "ما هي عاصمة اليمن؟", "a": "صنعاء"},
+            {"q": "كم عدد أيام الأسبوع؟", "a": "7"},
+            {"q": "ما أكبر كوكب في المجموعة الشمسية؟", "a": "المشتري"},
+        ]
+    if gtype in ("fastest", "word"):
+        spec["words"] = ["انتصار", "مغامرة", "عاصفة", "بستان", "صاروخ", "نجمة"]
+    if gtype == "guess":
+        spec["max_number"] = 50
+        spec["max_attempts"] = 12
+    return spec
+
+
+def _sanitize_spec(obj, gtype, name):
+    spec = _spec_defaults(gtype, name)
+    if not isinstance(obj, dict):
+        return spec
+
+    def aiint(v, d, lo=None, hi=None):
+        try:
+            if isinstance(v, (int, float)):
+                n = int(v)
+            else:
+                mm = re.search(r"-?\d+", str(v or ""))
+                n = int(mm.group(0)) if mm else d
+        except Exception:
+            n = d
+        if lo is not None: n = max(lo, n)
+        if hi is not None: n = min(hi, n)
+        return n
+
+    cmd = re.sub(r"[^\w\u0600-\u06ff-]", "", str(obj.get("command") or name).replace(" ", ""))[:24].lower()
+    spec["command"] = cmd or spec["command"]
+    spec["title"] = str(obj.get("title") or name)[:80]
+    spec["win_chance"] = aiint(obj.get("win_chance"), 50, 1, 100)
+    spec["win_points"] = aiint(obj.get("win_points"), 50, -100000, 100000)
+    spec["lose_points"] = aiint(obj.get("lose_points"), 0, -100000, 100000)
+    spec["timeout_seconds"] = aiint(obj.get("timeout_seconds"), 60, 15, 300)
+    spec["win_message"] = str(obj.get("win_message") or spec["win_message"])[:200]
+    spec["lose_message"] = str(obj.get("lose_message") or spec["lose_message"])[:200]
+    spec["image_prompt"] = str(obj.get("image_prompt") or spec["image_prompt"])[:1000]
+    if gtype == "quiz":
+        items = []
+        for q in (obj.get("questions") or []):
+            if isinstance(q, dict) and q.get("q") and q.get("a"):
+                items.append({"q": str(q["q"])[:200], "a": str(q["a"])[:80]})
+        if items: spec["questions"] = items[:20]
+    if gtype in ("fastest", "word"):
+        words = [str(w).strip()[:30] for w in (obj.get("words") or []) if str(w).strip()]
+        if words: spec["words"] = words[:30]
+    if gtype == "guess":
+        spec["max_number"] = aiint(obj.get("max_number"), 50, 5, 1000)
+        spec["max_attempts"] = aiint(obj.get("max_attempts"), 12, 3, 50)
+    return spec
+
+
 async def make_game_spec_from_design(state):
-    idea=state.get("idea") or {}; theme=state.get("theme") or "متنوعة"
-    prompt=("حوّل فكرة اللعبة إلى تعريف جاهز لبوت Giant Chat. "
-            f"الفكرة: {idea.get('name')} — {idea.get('summary')} — {idea.get('core')}. "
-            f"التصنيف: {theme}. تفاصيل الماستر: {state.get('details','')}. "
-            "أعد JSON فقط بالمفاتيح command,title,win_chance,win_points,lose_points,win_message,lose_message,image_prompt. "
-            "command كلمة عربية قصيرة بدون مسافات. win_chance رقم 1-100. لا تستخدم كود أو HTML.")
-    raw, err=await ai_response(prompt,900)
+    idea = state.get("idea") or {}
+    theme = state.get("theme") or "متنوعة"
+    gtype = state.get("game_type") or "chance"
+    name = idea.get("name") or "لعبة جديدة"
+    extra = ""
+    if gtype == "quiz":
+        extra = 'وأضف المفتاح questions كمصفوفة من 6 عناصر بالشكل {"q":"سؤال","a":"إجابة قصيرة"} بالعربية. '
+    elif gtype in ("fastest", "word"):
+        extra = "وأضف المفتاح words كمصفوفة من 10 كلمات عربية مناسبة. "
+    elif gtype == "guess":
+        extra = "وأضف المفتاحين max_number وmax_attempts. "
+    prompt = ("حوّل فكرة اللعبة إلى تعريف جاهز لبوت دردشة عربي. "
+              f"الفكرة: {name} — {idea.get('summary','')} — {idea.get('core','')}. "
+              f"التصنيف: {theme}. نوع اللعب: {gtype} ({GAME_TYPE_HINTS.get(gtype,'')}). "
+              f"تفاصيل الماستر: {state.get('details','')}. "
+              "أعد JSON فقط بالمفاتيح command,title,win_chance,win_points,lose_points,timeout_seconds,"
+              "win_message,lose_message,image_prompt " + extra +
+              "command كلمة عربية قصيرة بدون مسافات. win_chance رقم 1-100. لا تستخدم كوداً أو HTML.")
+    raw, err = await ai_response(prompt, 1400)
     if err:
-        name=idea.get('name') or 'لعبة جديدة'
-        return {"command":re.sub(r"[^\w\u0600-\u06ff-]","",name.replace(" ",""))[:24] or "لعبة","title":name,"win_chance":50,"win_points":50,"lose_points":0,"win_message":"🎉 فزت!","lose_message":"😔 حظاً سعيداً، حاول مرة أخرى.","image_prompt":f"غلاف لعبة {name} في Giant Chat"}
+        return _spec_defaults(gtype, name)
     try:
-        m=re.search(r'\{.*\}',raw,re.S); obj=json.loads(m.group(0) if m else raw)
-        def aiint(v,d,lo=None,hi=None):
-            try:
-                if isinstance(v,(int,float)): n=int(v)
-                else:
-                    mm=re.search(r'-?\d+',str(v or '')); n=int(mm.group(0)) if mm else d
-            except Exception: n=d
-            if lo is not None: n=max(lo,n)
-            if hi is not None: n=min(hi,n)
-            return n
-        return {"command":re.sub(r"[^\w\u0600-\u06ff-]","",str(obj.get("command") or idea.get("name") or "لعبة").replace(" ",""))[:24].lower(),"title":str(obj.get("title") or idea.get("name") or "لعبة جديدة")[:80],"win_chance":aiint(obj.get("win_chance"),50,1,100),"win_points":aiint(obj.get("win_points"),50,-1000000,1000000),"lose_points":aiint(obj.get("lose_points"),0,-1000000,1000000),"win_message":str(obj.get("win_message") or "🎉 فوز!")[:200],"lose_message":str(obj.get("lose_message") or "😔 حظاً سعيداً")[:200],"image_prompt":str(obj.get("image_prompt") or "غلاف لعبة جديدة")[:1000]}
+        m = re.search(r"\{.*\}", raw, re.S)
+        obj = json.loads(m.group(0) if m else raw)
     except Exception:
-        name=idea.get('name') or 'لعبة جديدة'
-        return {"command":re.sub(r"[^\w\u0600-\u06ff-]","",name.replace(" ",""))[:24] or "لعبة","title":name,"win_chance":50,"win_points":50,"lose_points":0,"win_message":"🎉 فوز!","lose_message":"😔 حظاً سعيداً","image_prompt":f"غلاف لعبة {name}"}
+        return _spec_defaults(gtype, name)
+    return _sanitize_spec(obj, gtype, name)
+
 
 async def finalize_designed_game(uid,spec):
     command=spec.get("command") or "لعبة"; existing={}; existing.update(load_testing_games()); existing.update(load_custom_games()); base=command; n=2
@@ -3395,37 +3522,122 @@ async def finalize_designed_game(uid,spec):
     except Exception as exc: spec["image_error"]=f"{type(exc).__name__}: {exc}"[:500]
     testing=load_testing_games(); testing[command]=spec; save_testing_games(testing); clear_game_design(uid)
     return (f"🧪 تم إنشاء اللعبة «{spec['title']}» في بيئة الاختبار.\n🎮 الأمر: {command}\n"
-            f"🎯 الفوز: {spec['win_chance']}% | 💰 الجائزة: {spec['win_points']} نقطة\n"
+            f"🎲 النوع: {GAME_TYPE_HINTS.get(spec.get('game_type','chance'), spec.get('game_type','chance'))}\n"
+            f"🎯 الفوز: {spec.get('win_chance',50)}% | 💰 الجائزة: {spec['win_points']} نقطة\n"
             f"🖼️ الصورة: {'✅ جاهزة' if spec.get('image_url') else '⚠️ لم ترفع'}\n"
             f"➡️ تشغيل الاختبار: تشغيل اختبار@{command}\n➡️ الاعتماد بعد النجاح: اعتماد لعبة {command}")
 
-async def handle_game_designer(sender,text):
-    low=normalize_text(text); state=get_game_design(sender)
-    if low in ("الغاء تصميم اللعبة","إلغاء تصميم اللعبة","الغاء اللعبة الجديدة","إلغاء"):
-        if state: clear_game_design(sender); return "🛑 تم إلغاء جلسة تصميم اللعبة."
+GAME_TYPE_ORDER = ["chance", "quiz", "math", "guess", "fastest", "word", "duel"]
+
+
+def _type_menu():
+    lines = ["🎲 اختر نوع اللعب (رقم):"]
+    for i, t in enumerate(GAME_TYPE_ORDER, 1):
+        lines.append(f"{i}️⃣ {GAME_TYPE_HINTS.get(t, t)}")
+    lines.append("💡 أو اكتب اسم النوع مباشرة.")
+    return "\n".join(lines)
+
+
+def _draft_text(spec):
+    out = [f"📝 مسودة اللعبة:", f"🎮 {spec['title']}", f"🔤 الأمر: {spec['command']}",
+           f"🎲 النوع: {GAME_TYPE_HINTS.get(spec.get('game_type','chance'), spec.get('game_type'))}",
+           f"💰 الجائزة: {spec['win_points']} نقطة | 📉 الخسارة: {spec['lose_points']}"]
+    if spec.get("game_type") == "chance":
+        out.append(f"🎯 نسبة الفوز: {spec['win_chance']}%")
+    else:
+        out.append(f"⏱️ المهلة: {spec.get('timeout_seconds', 60)} ثانية")
+    if spec.get("questions"):
+        out.append(f"❓ الأسئلة: {len(spec['questions'])} سؤال")
+    if spec.get("words"):
+        out.append(f"🔤 الكلمات: {len(spec['words'])} كلمة")
+    if spec.get("max_number"):
+        out.append(f"🔢 المدى: 1 - {spec['max_number']}")
+    out.append("\n✅ «اعتمد التصميم» لإنشائها في الاختبار\n✏️ «عدل ...» للتعديل\n🛑 «الغاء تصميم اللعبة» للإلغاء")
+    return "\n".join(out)
+
+
+async def handle_game_designer(sender, text):
+    low = normalize_text(text)
+    state = get_game_design(sender)
+    if low in ("الغاء تصميم اللعبة", "إلغاء تصميم اللعبة", "الغاء اللعبة الجديدة", "إلغاء", "الغاء"):
+        if state:
+            clear_game_design(sender)
+            return "🛑 تم إلغاء جلسة تصميم اللعبة."
         return None
-    if not state and low in ("اخترع لعبة جديدة","إخترع لعبة جديدة","صمم لعبة جديدة","فكر معي لعبة","ابتكر لعبة جديدة"):
-        set_game_design(sender,{"stage":"category","created_at":now_iso()})
-        return "🧠 لنبتكر لعبة جديدة معاً. اختر النوع:\n1️⃣ حظ وجوائز\n2️⃣ تحدي سرعة\n3️⃣ منافسة بين لاعبين\n4️⃣ تخمين وأسئلة\n5️⃣ لعبة جماعية\n6️⃣ كلمات وذكاء\n7️⃣ مغامرة ومفاجآت\n💡 أو اكتب فكرتك مباشرة."
-    if not state: return None
-    stage=state.get("stage")
-    if stage=="category":
-        theme=GAME_DESIGN_CATEGORIES.get(low.strip(),str(text).strip()[:100]); ideas=await brainstorm_game_ideas(theme); state.update({"stage":"idea","theme":theme,"ideas":ideas}); set_game_design(sender,state)
-        return "🧠 التصنيف: "+theme+"\n"+"\n".join(f"{i}️⃣ {x['name']} — {x['summary']}" for i,x in enumerate(ideas,1))+"\n✏️ أو اكتب فكرتك بنفسك."
-    if stage=="idea":
-        ideas=state.get("ideas") or []; chosen=ideas[int(low)-1] if low.isdigit() and 1<=int(low)<=len(ideas) else {"name":str(text).strip()[:60],"summary":"فكرة الماستر","players":"1","core":str(text).strip()[:300]}
-        state.update({"stage":"details","idea":chosen}); set_game_design(sender,state)
-        return f"🎮 الفكرة: {chosen['name']}\n📝 {chosen['summary']}\n\nأعطني التفاصيل: عدد اللاعبين، المهلة، الجائزة، طريقة الفوز... أو اكتب «نفذها»."
-    if stage=="details":
-        state["details"]="إعدادات مناسبة ومتوازنة." if low in ("نفذها","نفذ","أنشئها","انشئها") else str(text).strip()[:1000]
-        spec=await make_game_spec_from_design(state); state.update({"stage":"confirm","draft":spec}); set_game_design(sender,state)
-        return (f"📝 مسودة اللعبة:\n🎮 {spec['title']}\n🔤 الأمر: {spec['command']}\n🎯 الفوز: {spec['win_chance']}%\n💰 الجائزة: {spec['win_points']} نقطة\n📉 الخسارة: {spec['lose_points']} نقطة\n\n✅ اكتب «اعتمد التصميم» لإنشائها في testing.\n✏️ اكتب «عدل ...» للتعديل.\n🛑 الغاء تصميم اللعبة للإلغاء.")
-    if stage=="confirm":
-        if low in ("اعتمد التصميم","اعتمد اللعبة","نفذها","نفذ","انشئ اللعبة","أنشئ اللعبة"): return await finalize_designed_game(sender,state.get("draft") or {})
-        if low.startswith("عدل "):
-            state["stage"]="details"; state["details"]=text.split(None,1)[1].strip()[:1000]; set_game_design(sender,state); return "✏️ تم تسجيل التعديل. أرسل «نفذها»."
-        return "⏳ أنت في مرحلة المراجعة. اكتب «اعتمد التصميم» أو «عدل ...»."
+    if not state and low in ("اخترع لعبة جديدة", "إخترع لعبة جديدة", "صمم لعبة جديدة", "فكر معي لعبة",
+                             "ابتكر لعبة جديدة", "لعبة جديدة", "انشئ لعبة", "أنشئ لعبة"):
+        set_game_design(sender, {"stage": "category", "created_at": now_iso()})
+        return ("🧠 لنبتكر لعبة جديدة معاً. اختر التصنيف:\n"
+                "1️⃣ حظ وجوائز\n2️⃣ تحدي سرعة\n3️⃣ منافسة بين لاعبين\n4️⃣ تخمين وأسئلة\n"
+                "5️⃣ لعبة جماعية\n6️⃣ كلمات وذكاء\n7️⃣ مغامرة ومفاجآت\n💡 أو اكتب فكرتك مباشرة.")
+    if not state:
+        return None
+    stage = state.get("stage")
+
+    if stage == "category":
+        theme = GAME_DESIGN_CATEGORIES.get(low.strip(), str(text).strip()[:100])
+        ideas = await brainstorm_game_ideas(theme)
+        state.update({"stage": "idea", "theme": theme, "ideas": ideas})
+        set_game_design(sender, state)
+        return ("🧠 التصنيف: " + theme + "\n" +
+                "\n".join(f"{i}️⃣ {x['name']} — {x['summary']}" for i, x in enumerate(ideas, 1)) +
+                "\n🔁 «المزيد» لأفكار أخرى\n✏️ أو اكتب فكرتك بنفسك.")
+
+    if stage == "idea":
+        if low in ("المزيد", "افكار اخرى", "أفكار أخرى", "غيرها"):
+            ideas = await brainstorm_game_ideas(state.get("theme") or "متنوعة")
+            state["ideas"] = ideas
+            set_game_design(sender, state)
+            return ("💡 أفكار جديدة:\n" +
+                    "\n".join(f"{i}️⃣ {x['name']} — {x['summary']}" for i, x in enumerate(ideas, 1)) +
+                    "\n🔁 «المزيد» لأفكار أخرى.")
+        ideas = state.get("ideas") or []
+        chosen = ideas[int(low) - 1] if low.isdigit() and 1 <= int(low) <= len(ideas) else {
+            "name": str(text).strip()[:60], "summary": "فكرة الماستر", "players": "1", "core": str(text).strip()[:300]}
+        state.update({"stage": "type", "idea": chosen})
+        set_game_design(sender, state)
+        return f"🎮 الفكرة: {chosen['name']}\n📝 {chosen['summary']}\n\n" + _type_menu()
+
+    if stage == "type":
+        gtype = None
+        if low.isdigit() and 1 <= int(low) <= len(GAME_TYPE_ORDER):
+            gtype = GAME_TYPE_ORDER[int(low) - 1]
+        elif low in GAME_TYPE_ORDER:
+            gtype = low
+        else:
+            for key, hint in GAME_TYPE_HINTS.items():
+                if low and (low in normalize_text(hint)):
+                    gtype = key
+                    break
+        if not gtype:
+            return "❌ لم أفهم النوع.\n" + _type_menu()
+        state.update({"stage": "details", "game_type": gtype})
+        set_game_design(sender, state)
+        return (f"✅ النوع: {GAME_TYPE_HINTS[gtype]}\n\n"
+                "أعطني التفاصيل: الجائزة، المهلة، طريقة الفوز، أي محتوى تريده...\n"
+                "أو اكتب «نفذها» وسأختار إعدادات متوازنة.")
+
+    if stage == "details":
+        state["details"] = "إعدادات مناسبة ومتوازنة." if low in ("نفذها", "نفذ", "أنشئها", "انشئها") else str(text).strip()[:1000]
+        spec = await make_game_spec_from_design(state)
+        state.update({"stage": "confirm", "draft": spec})
+        set_game_design(sender, state)
+        return _draft_text(spec)
+
+    if stage == "confirm":
+        if low in ("اعتمد التصميم", "اعتمد اللعبة", "نفذها", "نفذ", "انشئ اللعبة", "أنشئ اللعبة", "موافق"):
+            return await finalize_designed_game(sender, state.get("draft") or {})
+        if low.startswith("عدل"):
+            state["stage"] = "details"
+            state["details"] = (text.split(None, 1)[1].strip()[:1000] if len(text.split(None, 1)) > 1 else "")
+            set_game_design(sender, state)
+            spec = await make_game_spec_from_design(state)
+            state.update({"stage": "confirm", "draft": spec})
+            set_game_design(sender, state)
+            return "✏️ تم التعديل.\n\n" + _draft_text(spec)
+        return "⏳ أنت في مرحلة المراجعة. اكتب «اعتمد التصميم» أو «عدل ...» أو «الغاء تصميم اللعبة»."
     return None
+
 
 async def add_ai_game(uid, description):
     if not description:
@@ -3587,9 +3799,62 @@ async def delete_game_definition(command):
     except Exception: pass
     return removed
 
+def build_master_help():
+    types = "\n".join(f"   • {k} — {v}" for k, v in (game_engine.GAME_TYPES.items() if game_engine else []))
+    return (
+        "👑 لوحة تحكم الماستر — كل الأوامر\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🏠 الغرف\n"
+        "• دخول اسم_الغرفة — دخول البوت لغرفة\n"
+        "• خروج اسم_الغرفة — خروج البوت\n"
+        "• غرفي — الغرف المتصلة\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🧠 ابتكار الألعاب (تفكير مشترك)\n"
+        "• اخترع لعبة جديدة — نفكر معاً خطوة بخطوة ثم ننفذ\n"
+        "• المزيد — أفكار إضافية أثناء الجلسة\n"
+        "• عدل ... — تعديل المسودة\n"
+        "• اعتمد التصميم — إنشاء اللعبة في بيئة الاختبار\n"
+        "• الغاء تصميم اللعبة — إنهاء الجلسة\n"
+        "• اضف لعبة اسم | وصف — إنشاء لعبة سريعة بالذكاء\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🎮 إدارة الألعاب\n"
+        "• الالعاب — كل الألعاب (تشغيل/اختبار) وأنواعها\n"
+        "• انواع الالعاب — أنواع اللعب المدعومة\n"
+        "• العاب الاختبار — ألعاب بيئة الاختبار\n"
+        "• تشغيل اختبار@الأمر / إيقاف اختبار@الأمر / حالة اختبار@الأمر\n"
+        "• اختبارات نشطة — الاختبارات الجارية\n"
+        "• اعتماد لعبة الأمر — نقلها للتشغيل الفعلي\n"
+        "• تعديل لعبة الأمر مفتاح=قيمة — تعديل خصائص لعبة\n"
+        "• حذف لعبة الأمر — حذف اللعبة نهائياً\n"
+        + (f"🎲 أنواع اللعب:\n{types}\n" if types else "")
+        + "━━━━━━━━━━━━━━━━━━\n"
+        "🧩 الأوامر المخصصة\n"
+        "• اضف امر الاسم | الرد — إضافة أمر جديد\n"
+        "• حذف امر الاسم — حذف أمر\n"
+        "• تعطيل امر الاسم / تفعيل امر الاسم\n"
+        "• الأوامر المضافة — عرض كل الأوامر المضافة\n"
+        "💡 صيغ الرد: نشر:نص | نقاط:عدد | خاص:نص | {user} {room}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🛠️ الصيانة والإصلاح الذاتي\n"
+        "• اصلاح — مركز الصيانة\n"
+        "• اصلاح فحص / موسيقى / العاب / صور / سجل\n"
+        "• اصلاح ذكي وصف_المشكلة — تشخيص بالذكاء الاصطناعي\n"
+        "• اصلاح ذاتيا — إصلاح الملفات والمجلدات وفحص الكود\n"
+        "• حالة البوت — التشغيل والشبكة والغرف\n"
+        "• نسخ احتياطي — نسخة آمنة إلى Telegram\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🎨 وسائط وتوثيق\n"
+        "• صمم وصف_الصورة — توليد صورة بالذكاء\n"
+        "• تشغيل التوثيق / إيقاف التوثيق / حالة التوثيق\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🔐 هذه الأوامر للماستر فقط وتُنفذ في الخاص."
+    )
+
+
 async def handle_ai_dm(sender, text):
-    if (await username_of(sender)).lower() != OWNER:
-        return "🚫 نظام الصيانة والذكاء الاصطناعي متاح لصاحب البوت فقط."
+    sender_name = await username_of(sender)
+    if not await is_master(sender, sender_name):
+        return "🚫 نظام الصيانة والذكاء الاصطناعي متاح للماستر فقط."
     low = normalize_text(text)
     designer_reply = await handle_game_designer(sender, text)
     if designer_reply is not None:
@@ -3607,6 +3872,60 @@ async def handle_ai_dm(sender, text):
         hb = int(max(0, time.time() - LAST_HEARTBEAT_AT)) if LAST_HEARTBEAT_AT else None
         return (f"🤖 حالة البوت الآن\n🟢 العملية: تعمل\n🌐 الشبكة: {'🟢 متصلة' if NETWORK_ONLINE else '🔴 منقطعة'}\n"
                 f"🏠 الغرف: {len(rooms)}\n💓 آخر heartbeat: {hb if hb is not None else '—'} ثانية\n⏱️ مدة التشغيل: {age} ثانية")
+
+    if low in ("اوامر الماستر", "أوامر الماستر", "master", "ماستر", "الاوامر", "الأوامر", "help"):
+        return build_master_help()
+
+    if low in ("انواع الالعاب", "أنواع الألعاب", "game types"):
+        if not game_engine:
+            return "⚠️ محرك الألعاب غير محمّل."
+        return "🎲 أنواع اللعب المدعومة:\n" + "\n".join(f"• {k} — {v}" for k, v in game_engine.GAME_TYPES.items())
+
+    if low in ("الالعاب", "الألعاب", "كل الالعاب", "كل الألعاب", "games"):
+        approved = load_custom_games(); testing = load_testing_games(); active = load_active_tests()
+        lines = ["🎮 الألعاب المصنوعة"]
+        if approved:
+            lines.append("🟢 تعمل في الغرف:")
+            for k, v in approved.items():
+                lines.append(f"• {k} — {v.get('title', k)} [{v.get('game_type', 'chance')}] 🎯{v.get('win_chance', 50)}% 💰{v.get('win_points', 0)}")
+        else:
+            lines.append("🟢 لا توجد ألعاب معتمدة بعد.")
+        if testing:
+            lines.append("🧪 في الاختبار:")
+            for k, v in testing.items():
+                lines.append(f"• {k} — {v.get('title', k)} [{v.get('game_type', 'chance')}] {'▶️ نشطة' if k in active else '⏸️ متوقفة'}")
+        lines.append("➕ لإنشاء لعبة: اخترع لعبة جديدة")
+        return "\n".join(lines)
+
+    if low.startswith("تعديل لعبة ") or low.startswith("عدل لعبة "):
+        body = text.split(None, 2)[2].strip() if len(text.split(None, 2)) > 2 else ""
+        bits = body.split(None, 1)
+        if len(bits) < 2 or "=" not in bits[1]:
+            return "❌ الصيغة: تعديل لعبة الأمر مفتاح=قيمة\n💡 المفاتيح: title, win_chance, win_points, lose_points, win_message, lose_message, game_type, timeout_seconds, max_number"
+        key = normalize_text(bits[0]).strip()
+        field, _, value = bits[1].partition("=")
+        field = field.strip().lower(); value = value.strip()
+        allowed_int = {"win_chance", "win_points", "lose_points", "timeout_seconds", "max_number", "max_attempts"}
+        allowed_str = {"title", "win_message", "lose_message", "game_type", "image_prompt"}
+        if field not in allowed_int | allowed_str:
+            return f"❌ المفتاح «{field}» غير مدعوم."
+        approved = load_custom_games(); testing = load_testing_games()
+        target = approved if key in approved else (testing if key in testing else None)
+        if target is None:
+            return f"❌ لا توجد لعبة باسم «{key}»."
+        if field in allowed_int:
+            try:
+                target[key][field] = int(re.search(r"-?\d+", value).group(0))
+            except Exception:
+                return "❌ القيمة يجب أن تكون رقماً."
+        else:
+            if field == "game_type" and game_engine and value not in game_engine.GAME_TYPES:
+                return "❌ نوع غير مدعوم. اكتب «انواع الالعاب»."
+            target[key][field] = value[:200]
+        target[key]["updated_at"] = now_iso()
+        if key in approved: save_custom_games(approved)
+        else: save_testing_games(testing)
+        return f"✅ تم تعديل «{key}»: {field} = {target[key][field]}"
 
     if low in ("الاوامر المضافة", "الأوامر المضافة", "اوامر مضافة", "custom commands"):
         cmds=load_custom_commands()
@@ -3733,10 +4052,12 @@ async def dm_loop():
                     parts = text.split(maxsplit=1)
                     cmd, arg = parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
                     low = normalize_text(text)
-                    is_owner = (await username_of(sender)).lower() == OWNER
+                    sender_name = await username_of(sender)
+                    is_owner = sender_name.lower() == OWNER
+                    is_master_user = await is_master(sender, sender_name)
                     reply = ""
                     # رد فوري + مؤشر تقدم للماستر أثناء الأوامر البطيئة.
-                    master_like = is_owner and bool(text)
+                    master_like = is_master_user and bool(text)
                     progress_task = None
                     progress_stop = None
                     started_at = time.time()
@@ -3756,31 +4077,25 @@ async def dm_loop():
                             progress_task = asyncio.create_task(_master_progress(), name="master-command-progress")
                         except Exception:
                             log.exception("failed to start master progress reporter")
-                    if cmd in ("دخول", "join") and is_owner:
+                    if cmd in ("دخول", "join") and is_master_user:
                         ok, m = await join(arg); reply = ("✅ " if ok else "❌ ") + m
-                    elif cmd in ("خروج", "leave") and is_owner:
+                    elif cmd in ("خروج", "leave") and is_master_user:
                         ok, m = await leave(arg); reply = ("✅ " if ok else "❌ ") + m
                     elif cmd in ("غرفي", "rooms"):
                         reply = "🏠 " + (", ".join(rooms.values()) if rooms else "لا توجد غرف")
-                    elif low in ("نسخ احتياطي", "backup", "backup@telegram") and is_owner:
+                    elif low in ("نسخ احتياطي", "backup", "backup@telegram") and is_master_user:
                         ok, m = await telegram_backup(); reply = m
-                    elif low in ("master", "ماستر", "اوامر الماستر", "أوامر الماستر") and is_owner:
-                        reply = ("👑 أوامر الماستر\n"
-                                 "اصلاح — مركز الصيانة والذكاء الاصطناعي\n"
-                                 "اصلاح ذكي مشكلة — تشخيص مشكلة\n"
-                                 "صمم وصف — تصميم صورة AI\n"
-                                 "اضف لعبة اسم | وصف — إنشاء لعبة وصورتها\n"
-                                 "نسخ احتياطي — رفع نسخة آمنة إلى Telegram\n"
-                                 "تشغيل التوثيق / إيقاف التوثيق / حالة التوثيق\n"
-                                 "اضف لعبة اسم | وصف — وضع اللعبة في testing\n"
-                                 "اعتماد لعبة command — نقل اللعبة إلى approved\n"
-                                 "العاب الاختبار — عرض ألعاب الاختبار\n"
-                                 "غرفي — عرض الغرف المتصلة\n"
-                                 "دخول اسم / خروج اسم — إدارة الغرف")
-                    elif text and (cmd in ("اصلاح", "إصلاح", "ذكاء", "ai", "صمم", "اضف", "أضف", "اعتماد", "اعتمد", "تشغيل", "إيقاف", "ايقاف", "حذف", "احذف", "تعطيل", "تفعيل", "حالة", "الأوامر", "الاوامر") or low.startswith(("اصلاح ", "إصلاح ", "صمم ", "اضف لعبة ", "أضف لعبة ", "اضف امر ", "أضف أمر ", "اضف أمر ", "حذف لعبة ", "احذف لعبة ", "حذف لعبه ", "احذف لعبه ", "حذف امر ", "احذف امر ", "حذف أمر ", "احذف أمر ", "تعطيل امر ", "تعطيل أمر ", "تفعيل امر ", "تفعيل أمر ", "اعتماد لعبة ", "اعتمد لعبة ", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق", "حالة التوثيق", "اصلاح ذاتيا", "إصلاح ذاتياً", "حالة البوت", "الأوامر المضافة", "الاوامر المضافة"))):
+                    elif low in ("master", "ماستر", "اوامر الماستر", "أوامر الماستر", "الاوامر", "الأوامر") and is_master_user:
+                        reply = build_master_help()
+                    elif is_master_user and text:
+                        # كل رسائل الماستر تمر على العقل الذكي للبوت (تصميم الألعاب، الصيانة، الأوامر...)
                         reply = await handle_ai_dm(sender, text)
-                    elif is_owner and text:
-                        reply = "ℹ️ استلمت أمرك، لكن الأمر غير معروف. اكتب «أوامر الماستر» لرؤية الأوامر المتاحة."
+                        if reply is None:
+                            hint, hint_err = await ai_response(
+                                "أنت مساعد الماستر داخل بوت دردشة عربي. رد بإيجاز على طلبه واقترح الأمر المناسب من أوامر البوت. "
+                                f"طلب الماستر: {text}", 400)
+                            reply = ("🤖 " + hint + "\n\n💡 اكتب «أوامر الماستر» لعرض كل الأوامر.") if not hint_err else \
+                                "ℹ️ الأمر غير معروف. اكتب «أوامر الماستر» لرؤية كل الأوامر المتاحة."
                     if progress_stop is not None:
                         progress_stop.set()
                     if progress_task is not None:
@@ -3834,6 +4149,17 @@ async def heartbeat_loop():
                 await broadcast_text("⌛ انتهت لعبة الحرب العالمية تلقائياً بسبب انتهاء المهلة. اكتب «حرب» لبدء لعبة جديدة.")
             except Exception:
                 log.exception("failed to announce global war timeout")
+        # إنهاء جولات الألعاب التفاعلية المنتهية زمنياً
+        if game_engine is not None:
+            try:
+                for rid_done, session in game_engine.expired_sessions():
+                    try:
+                        await room_send(rid_done, game_engine.timeout_text(session))
+                    except Exception:
+                        log.exception("failed to announce game timeout")
+            except Exception:
+                log.exception("game engine timeout sweep failed")
+
         # تنظيف طلبات نشر@ القديمة
         for key, pending in list(publish_pending.items()):
             created = pending.get("created_at", 0) if isinstance(pending, dict) else pending
