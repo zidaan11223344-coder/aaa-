@@ -973,7 +973,9 @@ async def handle_social_reaction(rid, text, uid, p_name):
     return f"✅ تم تسجيل {labels[action_key]} وإرسال الإشعار إلى خاص الناشر."
 
 async def telegram_find_chat_id():
-    """Return the configured Telegram backup chat, or fall back to the latest private chat."""
+    """Find the latest private Telegram chat that interacted with this bot.
+    TELEGRAM_BACKUP_CHAT_ID is optional; the user only needs to send /start to the bot once.
+    """
     if not TELEGRAM_BOT_TOKEN:
         return None, "⚠️ أضف TELEGRAM_BOT_TOKEN في Railway Variables."
     if TELEGRAM_BACKUP_CHAT_ID:
@@ -989,145 +991,45 @@ async def telegram_find_chat_id():
             for update in reversed(updates):
                 msg = update.get("message") or {}
                 chat = msg.get("chat") or {}
-                if chat.get("id") is not None and chat.get("type") in ("private", "group", "supergroup"):
+                if chat.get("type") == "private" and chat.get("id") is not None:
                     return str(chat["id"]), None
-            return None, "⚠️ لم أجد محادثة Telegram. ضع TELEGRAM_BACKUP_CHAT_ID في Railway أو أرسل رسالة من المجموعة إلى البوت ثم أعد المحاولة."
+            return None, "⚠️ لم أجد محادثة خاصة مع البوت. أرسل /start إلى بوت Telegram أولاً ثم أعد أمر نسخ احتياطي."
     except Exception as exc:
         return None, f"❌ تعذر تحديد محادثة Telegram: {type(exc).__name__}: {exc}"
 
-
-def _backup_excluded(rel: Path) -> bool:
-    """Exclude secrets/cache/runtime junk while keeping the actual bot project and data."""
-    parts = set(rel.parts)
-    name = rel.name
-    # Never put credentials, cookies, local secrets or Python caches into Telegram backups.
-    if name in {
-        ".env", ".env.local", ".env.production", "youtube_cookies.txt", "spotify_cookies.txt",
-        "serviceAccountKey.json", "firebase_credentials.json", "credentials.json",
-    }:
-        return True
-    if any(part in {"__pycache__", ".git", ".venv", "venv", "node_modules"} for part in rel.parts):
-        return True
-    # Generated temporary backup archives must never be recursively backed up.
-    if any(part.startswith("bot_backup_") for part in rel.parts):
-        return True
-    # Common compiled/temp files are not useful for recovery.
-    if name.endswith((".pyc", ".pyo", ".tmp", ".part")):
-        return True
-    return False
-
-
-def _collect_backup_files(root: Path):
-    """Collect all project files, including JSON state and assets, except secrets/cache."""
-    files = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(root)
-        if _backup_excluded(rel):
-            continue
-        try:
-            files.append((path, rel.as_posix(), path.stat().st_size))
-        except OSError:
-            log.warning("backup: cannot stat %s", path)
-    files.sort(key=lambda item: item[1])
-    return files
-
-
-def _write_backup_archive(root: Path, archive: Path):
-    files = _collect_backup_files(root)
-    total_bytes = sum(size for _, _, size in files)
-    manifest = {
-        "created_at": now_iso(),
-        "project": root.name,
-        "files": len(files),
-        "bytes": total_bytes,
-        "excluded": [
-            "environment secrets (.env)",
-            "API/service-account credential files",
-            "YouTube/Spotify cookie files",
-            "Python caches (__pycache__, *.pyc)",
-            "git/virtualenv/node_modules directories",
-            "temporary backup archives",
-        ],
-    }
-    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-        z.writestr("BACKUP_MANIFEST.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-        for path, rel, _ in files:
-            try:
-                z.write(path, arcname=rel)
-            except OSError:
-                log.warning("backup: skipped unreadable file %s", path)
-    return len(files), total_bytes
-
-
-async def _telegram_send_document(chat_id: str, path: Path, caption: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-    form = aiohttp.FormData()
-    form.add_field("chat_id", str(chat_id))
-    form.add_field("caption", caption)
-    with path.open("rb") as fh:
-        form.add_field("document", fh, filename=path.name, content_type="application/zip")
-        async with http.post(url, data=form, timeout=aiohttp.ClientTimeout(total=180)) as resp:
-            body = await resp.text()
-            if resp.status >= 400:
-                return False, f"HTTP {resp.status}: {body[:500]}"
-            try:
-                payload = json.loads(body)
-            except Exception:
-                payload = {}
-            if not payload.get("ok", False):
-                return False, body[:500]
-    return True, "ok"
-
-
 async def telegram_backup():
-    """Create a complete recoverable project backup and send it to the configured Telegram group."""
+    """Create a safe backup and send it using TELEGRAM_BOT_TOKEN only."""
     if not TELEGRAM_BOT_TOKEN:
         return False, "⚠️ أضف TELEGRAM_BOT_TOKEN في Railway Variables."
     chat_id, chat_error = await telegram_find_chat_id()
     if not chat_id:
         return False, chat_error
-
     tmp = Path(tempfile.mkdtemp(prefix="bot_backup_"))
     archive = tmp / f"bot_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.zip"
     try:
-        count, total_bytes = await asyncio.to_thread(_write_backup_archive, BASE_DIR, archive)
-        # Telegram's Bot API has a practical per-file limit. Keep a safety margin and split if needed.
-        max_part = 45 * 1024 * 1024
-        if archive.stat().st_size <= max_part:
-            ok, err = await _telegram_send_document(
-                chat_id, archive,
-                f"📦 النسخة الاحتياطية الكاملة للبوت\n📁 الملفات: {count}\n💾 البيانات: {total_bytes / 1024 / 1024:.2f} MB\n🔐 تم استبعاد الأسرار وملفات الكوكيز فقط."
-            )
-            if not ok:
-                return False, f"❌ فشل رفع النسخة إلى Telegram: {err}"
-            return True, "✅ تم إنشاء وإرسال النسخة الاحتياطية الكاملة إلى مجموعة Telegram."
-
-        # Split the ZIP bytes into Telegram-safe parts. The original ZIP remains recoverable by concatenating parts.
-        size = archive.stat().st_size
-        part_paths = []
-        with archive.open("rb") as src:
-            index = 1
-            while True:
-                chunk = src.read(max_part)
-                if not chunk:
-                    break
-                part = tmp / f"{archive.stem}.part{index:03d}.zip.part"
-                part.write_bytes(chunk)
-                part_paths.append(part)
-                index += 1
-        total_parts = len(part_paths)
-        for index, part in enumerate(part_paths, 1):
-            ok, err = await _telegram_send_document(
-                chat_id, part,
-                f"📦 النسخة الاحتياطية الكاملة — الجزء {index}/{total_parts}\n"
-                f"📁 إجمالي الملفات: {count}\n"
-                f"ℹ️ اجمع الأجزاء بالترتيب لإعادة ملف ZIP الأصلي."
-            )
-            if not ok:
-                return False, f"❌ فشل رفع الجزء {index}/{total_parts}: {err}"
-        return True, f"✅ أُرسلت النسخة الاحتياطية الكاملة إلى المجموعة على {total_parts} أجزاء."
+        include = ["rooms.json", "masters.json", "bans.json", "moderation.json", "welcome.json",
+                   "replies.json", "points.json", "vip_users.json", "custom_games.json", "published_posts.json", "social_events.json"]
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
+            # config بدون كلمات مرور/مفاتيح. الأسرار لا تدخل النسخة الاحتياطية.
+            safe_config = dict(C)
+            for secret_key in ("password", "supabase_key", "youtube_cookies", "api_key", "openai_api_key"):
+                safe_config.pop(secret_key, None)
+            z.writestr("config.safe.json", json.dumps(safe_config, ensure_ascii=False, indent=2))
+            for name in include:
+                path = BASE_DIR / name
+                if path.is_file(): z.write(path, arcname=name)
+            logp = BASE_DIR / "logs" / "bot.log"
+            if logp.is_file(): z.write(logp, arcname="logs/bot.log")
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        form = aiohttp.FormData()
+        form.add_field("chat_id", chat_id)
+        form.add_field("caption", "📦 نسخة احتياطية آمنة للبوت\n🔐 تم استبعاد مفاتيح API وكوكيز YouTube.")
+        form.add_field("document", archive.open("rb"), filename=archive.name, content_type="application/zip")
+        async with http.post(url, data=form, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+            if resp.status >= 400:
+                body = await resp.text()
+                return False, f"❌ فشل رفع النسخة إلى Telegram: HTTP {resp.status} {body[:300]}"
+        return True, "✅ تم إنشاء ورفع النسخة الاحتياطية إلى Telegram."
     except Exception as exc:
         log.exception("telegram backup failed")
         return False, f"❌ تعذر إنشاء النسخة الاحتياطية: {type(exc).__name__}: {exc}"
