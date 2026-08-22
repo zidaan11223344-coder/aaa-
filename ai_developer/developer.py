@@ -60,14 +60,9 @@ def validate_game(data):
         "win_message": str(data.get("win_message") or "🎉 فوز!")[:200],
         "lose_message": str(data.get("lose_message") or "😅 حظاً أوفر!")[:200],
         "image_prompt": str(data.get("image_prompt") or "Game card")[:1000],
-        "game_type": str(data.get("game_type") or "chance")[:20],
-        "timeout_seconds": normalize_int(data.get("timeout_seconds", 60), 60, 15, 300),
         "status": "testing",
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    for key in ("questions", "words", "max_number", "max_attempts", "image_url"):
-        if data.get(key) is not None:
-            out[key] = data[key]
     return out
 
 
