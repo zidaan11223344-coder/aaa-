@@ -307,9 +307,14 @@ MUSIC_MAX_DURATION = int(C.get("music_max_duration_seconds", 900))
 # على Railway يفضل استخدام RAILWAY_PUBLIC_DOMAIN تلقائياً، أو ضع PUBLIC_BASE_URL يدوياً.
 # استخدم نطاق Railway الحالي أولاً حتى لا يبقى رابط قديم من Environment منسوخ من مشروع آخر.
 _RAILWAY_DOMAIN = str(os.environ.get("RAILWAY_PUBLIC_DOMAIN") or "").strip().strip("/")
+# إذا وضع المالك PUBLIC_BASE_URL يدوياً فهو المصدر الأول، ثم نطاق Railway التلقائي.
+# هذا يمنع بقاء رابط مشروع قديم بعد نسخ Environment Variables.
+_explicit_public_base = str(os.environ.get("PUBLIC_BASE_URL") or "").strip().strip("/")
+if _explicit_public_base and not _explicit_public_base.startswith(("http://", "https://")):
+    _explicit_public_base = "https://" + _explicit_public_base
 PUBLIC_BASE_URL = str(
-    (f"https://{_RAILWAY_DOMAIN}" if _RAILWAY_DOMAIN else "")
-    or os.environ.get("PUBLIC_BASE_URL")
+    _explicit_public_base
+    or (f"https://{_RAILWAY_DOMAIN}" if _RAILWAY_DOMAIN else "")
     or C.get("music_public_base_url")
 ).rstrip("/")
 MEDIA_PATH = "/media"
@@ -852,39 +857,45 @@ async def send_gift_command(rid, sender_uid, sender_name, raw_text):
     return None
 
 
+async def _db_insert(table_name, payload):
+    res, err = await run(lambda: sb.table(table_name).insert(payload).execute())
+    if err:
+        raise RuntimeError(f"{table_name} insert failed: {err}")
+    return res
+
 async def room_send(rid, text):
-    await run(lambda: sb.table("room_messages").insert({
-        "room_id": rid, "user_id": BOT_ID, "content": text, "message_type": "text"
-    }).execute())
+    return await _db_insert("room_messages", {
+        "room_id": rid, "user_id": BOT_ID, "content": text or "", "message_type": "text"
+    })
 
 async def room_send_media(rid, text, media_url, m_type="text", duration_ms=None):
     payload = {
         "room_id": rid,
         "user_id": BOT_ID,
-        "content": text,
+        "content": text or "",
         "message_type": m_type,
         "media_url": media_url,
         "media_duration_ms": duration_ms,
     }
-    await run(lambda: sb.table("room_messages").insert(payload).execute())
+    return await _db_insert("room_messages", payload)
 
 async def dm_send(uid, text):
     envelope = {
-        "v": 1, "id": str(uuid.uuid4()), "content": text, "message_type": "text",
+        "v": 1, "id": str(uuid.uuid4()), "content": text or "", "message_type": "text",
         "media_url": None, "media_duration_ms": None, "reply_to_id": None, "created_at": now_iso()
     }
-    await run(lambda: sb.table("dm_relay").insert({
+    return await _db_insert("dm_relay", {
         "sender_id": BOT_ID, "recipient_id": uid, "envelope": envelope
-    }).execute())
+    })
 
-async def dm_send_media(uid, text, media_url, m_type="image"):
+async def dm_send_media(uid, text, media_url, m_type="image", duration_ms=None):
     envelope = {
         "v": 1, "id": str(uuid.uuid4()), "content": text or "", "message_type": m_type,
-        "media_url": media_url, "media_duration_ms": None, "reply_to_id": None, "created_at": now_iso()
+        "media_url": media_url, "media_duration_ms": duration_ms, "reply_to_id": None, "created_at": now_iso()
     }
-    await run(lambda: sb.table("dm_relay").insert({
+    return await _db_insert("dm_relay", {
         "sender_id": BOT_ID, "recipient_id": uid, "envelope": envelope
-    }).execute())
+    })
 
 
 def _code4():
@@ -1499,9 +1510,11 @@ async def start_media_server():
         }.get(path.suffix.lower(), "application/octet-stream")
         return web.FileResponse(path, headers={
             "Content-Type": ctype,
+            "Content-Disposition": f'inline; filename="{path.name}"',
             "Accept-Ranges": "bytes",
             "Cache-Control": "public, max-age=86400",
             "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "Content-Length,Content-Range,Accept-Ranges,Content-Type",
         })
 
     app.router.add_get(f"{MEDIA_PATH}/{{name}}", media_handler)
@@ -1664,12 +1677,12 @@ async def _prepare_music_track(track, source_label):
     if err:
         return None, err
     try:
-        if not local_path or not Path(local_path).is_file() or Path(local_path).stat().st_size <= 4096:
+        if not local_path or not Path(local_path).is_file() or Path(local_path).stat().st_size <= 16 * 1024:
             return None, "تم تنزيل الصوت لكن الملف فارغ أو تالف، لذلك لم يتم إرسال بصمة صوت."
         local_path, convert_err = await _convert_audio_to_mp3(local_path)
         if convert_err:
             log.warning(convert_err)
-        if not local_path or not Path(local_path).is_file() or Path(local_path).stat().st_size <= 4096:
+        if not local_path or not Path(local_path).is_file() or Path(local_path).stat().st_size <= 16 * 1024:
             return None, "فشل تجهيز ملف الصوت بعد التحويل؛ تم منع إرسال صوت فارغ."
         duration_ms = await _audio_duration_ms(local_path)
         if duration_ms <= 0:
@@ -2789,6 +2802,16 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     # بالـUID أو اسم الحساب عبر is_master() بدل مقارنة UID باسم مستخدم.
     active_tests = load_active_tests()
     testing_games = load_testing_games()
+    # يمكن للمالك بدء تجربة لعبة مباشرة من الغرفة بصيغة اختبار@command أو تشغيل اختبار@command.
+    if cmd.startswith("اختبار@") or cmd.startswith("الاختبار@"):
+        test_key = _resolve_testing_key(cmd.split("@", 1)[1], testing_games)
+        if not await is_master(uid, p_name):
+            return "🔐 لعبة الاختبار متاحة للمالك/الماستر فقط."
+        if test_key not in testing_games:
+            return f"❌ لا توجد لعبة اختبار باسم «{test_key}». اكتب «العاب الاختبار»."
+        active_tests[test_key] = {"enabled": True, "activated_at": now_iso()}
+        save_active_tests(active_tests)
+        cmd = test_key
     if cmd in active_tests and cmd in testing_games:
         if not await is_master(uid, p_name):
             return "🔐 لعبة الاختبار متاحة للمالك/الماستر فقط."
@@ -2909,11 +2932,27 @@ def save_active_tests(data):
     Path(TESTING_STATE_PATH).parent.mkdir(parents=True, exist_ok=True)
     save_json(TESTING_STATE_PATH, data)
 
+def _resolve_testing_key(command, testing=None):
+    testing = testing if isinstance(testing, dict) else load_testing_games()
+    wanted = normalize_text(command).strip().lstrip("@")
+    if wanted in testing:
+        return wanted
+    # دعم اختلاف حالة الأحرف/المسافات وبعض النسخ التي حفظت الأمر مع @.
+    for key in testing:
+        clean = normalize_text(key).strip().lstrip("@")
+        if clean == wanted:
+            return key
+    # إذا كتب المالك اسم اللعبة بدل command، اسمح بالمطابقة مع title.
+    for key, item in testing.items():
+        if normalize_text(item.get("title", "")) == wanted:
+            return key
+    return wanted
+
 def activate_test_game(command):
-    key = normalize_text(command).strip()
     testing = load_testing_games()
+    key = _resolve_testing_key(command, testing)
     if key not in testing:
-        return False, f"❌ لا توجد لعبة اختبار باسم «{key}»."
+        return False, f"❌ لا توجد لعبة اختبار باسم «{key}».\n🧪 اكتب «العاب الاختبار» لمعرفة الألعاب الموجودة فعلياً."
     active = load_active_tests()
     active[key] = {"enabled": True, "activated_at": now_iso()}
     save_active_tests(active)
@@ -2921,8 +2960,12 @@ def activate_test_game(command):
     return True, f"🧪 تم تشغيل اختبار «{title}».\n🎮 اكتب «{key}» داخل أي غرفة لتجربتها.\n🔐 الاختبار متاح لصاحب البوت فقط."
 
 def deactivate_test_game(command):
-    key = normalize_text(command).strip()
     active = load_active_tests()
+    key = _resolve_testing_key(command)
+    if key not in active:
+        # جرّب المفاتيح المنسوخة مع اختلاف بسيط.
+        matched = next((k for k in active if normalize_text(k).lstrip("@") == normalize_text(command).lstrip("@")), None)
+        key = matched or key
     if key not in active:
         return False, f"ℹ️ لعبة «{key}» ليست في وضع الاختبار."
     active.pop(key, None)
@@ -2931,7 +2974,7 @@ def deactivate_test_game(command):
 
 def approve_testing_game(command):
     testing = load_testing_games()
-    key = str(command).strip().lower()
+    key = _resolve_testing_key(command, testing)
     item = testing.get(key)
     if not item:
         return False, f"❌ لا توجد لعبة اختبار باسم {key}."
@@ -2940,6 +2983,9 @@ def approve_testing_game(command):
     save_custom_games(approved)
     testing.pop(key, None)
     save_testing_games(testing)
+    active = load_active_tests()
+    active.pop(key, None)
+    save_active_tests(active)
     return True, f"✅ تم اعتماد اللعبة «{item.get('title', key)}» ونقلها من testing إلى approved."
 
 
@@ -3194,6 +3240,22 @@ async def add_ai_game(uid, description):
             "lose_message": str(data.get("lose_message") or "😅 خسارة!")[:200],
             "image_prompt": str(data.get("image_prompt") or f"Game card for {name}, no text")[:1000],
         }
+        # أنشئ صورة حقيقية للعبة واحفظ رابطها، حتى تعمل أثناء testing ثم تنتقل مع اللعبة عند الاعتماد.
+        try:
+            image_path, image_err = await generate_ai_image(data["image_prompt"], f"game_{command}")
+            if image_path and not image_err:
+                data["image_url"] = await _store_media(image_path, "game", "image/jpeg")
+                try:
+                    image_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            else:
+                data["image_url"] = None
+                if image_err:
+                    log.warning("AI game image generation failed: %s", image_err)
+        except Exception as image_exc:
+            data["image_url"] = None
+            log.warning("AI game image storage failed: %s", image_exc)
         # ضع اللعبة في بيئة الاختبار فقط، وليس custom_games.json.
         testing = load_testing_games()
         data["status"] = "testing"
@@ -3240,21 +3302,25 @@ async def handle_ai_dm(sender, text):
         return "🔓 تم إيقاف توثيق الحسابات. أصبحت الخدمات المحمية متاحة للجميع."
     if low in ("حالة التوثيق", "verification status"):
         return f"🔐 توثيق الحسابات: {'مفعّل' if VERIFICATION_ENABLED else 'متوقف'}"
-    if low.startswith("تشغيل اختبار@") or low.startswith("تشغيل اختبار "):
-        command = text.split("@", 1)[1].strip() if "@" in text else text.split(None, 2)[2].strip()
-        ok, msg = activate_test_game(command)
+    # أوامر الاختبار تقبل جميع الصيغ الشائعة: تشغيل اختبار@x / تشغيل اختبار x / اختبار@x.
+    m_test = re.match(r"^(?:تشغيل\s+)?(?:اختبار|الاختبار)\s*@?\s*(.+)$", low)
+    if m_test:
+        command = m_test.group(1).strip()
+        if command:
+            ok, msg = activate_test_game(command)
+            return msg
+    m_stop = re.match(r"^(?:إيقاف|ايقاف|تعطيل)\s+(?:اختبار|الاختبار)\s*@?\s*(.+)$", low)
+    if m_stop:
+        ok, msg = deactivate_test_game(m_stop.group(1).strip())
         return msg
-    if low.startswith("إيقاف اختبار@") or low.startswith("ايقاف اختبار@") or low.startswith("إيقاف اختبار ") or low.startswith("ايقاف اختبار "):
-        command = text.split("@", 1)[1].strip() if "@" in text else text.split(None, 2)[2].strip()
-        ok, msg = deactivate_test_game(command)
-        return msg
-    if low.startswith("حالة اختبار@") or low.startswith("حالة اختبار "):
-        command = text.split("@", 1)[1].strip() if "@" in text else text.split(None, 2)[2].strip()
-        key = normalize_text(command).strip()
-        active = load_active_tests()
+    m_status = re.match(r"^حالة\s+(?:اختبار|الاختبار)\s*@?\s*(.+)$", low)
+    if m_status:
+        command = m_status.group(1).strip()
         testing = load_testing_games()
+        key = _resolve_testing_key(command, testing)
+        active = load_active_tests()
         if key not in testing:
-            return f"❌ لا توجد لعبة اختبار باسم «{key}»."
+            return f"❌ لا توجد لعبة اختبار باسم «{key}».\n🧪 اكتب «العاب الاختبار» لمعرفة القائمة."
         return f"🧪 لعبة الاختبار: {testing[key].get('title', key)}\n🎮 الأمر: {key}\n📌 الحالة: {'🟢 تعمل للاختبار' if key in active else '🔴 متوقفة'}"
     if low in ("اختبارات نشطة", "الاختبارات النشطة", "active tests"):
         active = load_active_tests()
@@ -3326,7 +3392,9 @@ async def dm_loop():
                                  "العاب الاختبار — عرض ألعاب الاختبار\n"
                                  "غرفي — عرض الغرف المتصلة\n"
                                  "دخول اسم / خروج اسم — إدارة الغرف")
-                    elif text and (cmd in ("اصلاح", "إصلاح", "ذكاء", "ai", "صمم", "اضف", "أضف", "اعتماد", "اعتمد", "تشغيل", "إيقاف", "ايقاف") or low.startswith(("اصلاح ", "إصلاح ", "صمم ", "اضف لعبة ", "أضف لعبة ", "اعتماد لعبة ", "اعتمد لعبة ", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق", "حالة التوثيق"))):
+                    elif text and is_owner:
+                        # أي رسالة من المالك في الخاص تمر أولاً على مركز الصيانة؛
+                        # هذا يجعل أوامر الاختبار والتوثيق والإصلاح قابلة للاكتشاف حتى لو اختلفت الصيغة.
                         reply = await handle_ai_dm(sender, text)
                     if reply: await dm_send(sender, reply)
                 await run(lambda i=row["id"]: sb.table("dm_relay").delete().eq("id", i).execute())
