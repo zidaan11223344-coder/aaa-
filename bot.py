@@ -305,13 +305,12 @@ MUSIC_MAX_DURATION = int(C.get("music_max_duration_seconds", 900))
 
 # رابط عام لملفات الصوت التي سيشغلها تطبيق Giant Chat.
 # على Railway يفضل استخدام RAILWAY_PUBLIC_DOMAIN تلقائياً، أو ضع PUBLIC_BASE_URL يدوياً.
+# استخدم نطاق Railway الحالي أولاً حتى لا يبقى رابط قديم من Environment منسوخ من مشروع آخر.
+_RAILWAY_DOMAIN = str(os.environ.get("RAILWAY_PUBLIC_DOMAIN") or "").strip().strip("/")
 PUBLIC_BASE_URL = str(
-    os.environ.get("PUBLIC_BASE_URL")
+    (f"https://{_RAILWAY_DOMAIN}" if _RAILWAY_DOMAIN else "")
+    or os.environ.get("PUBLIC_BASE_URL")
     or C.get("music_public_base_url")
-    or (
-        f"https://{os.environ.get('RAILWAY_PUBLIC_DOMAIN').strip('/')}"
-        if os.environ.get("RAILWAY_PUBLIC_DOMAIN") else ""
-    )
 ).rstrip("/")
 MEDIA_PATH = "/media"
 MEDIA_SERVER_PORT = int(os.environ.get("PORT", "8080"))
@@ -1614,6 +1613,44 @@ async def _convert_audio_to_mp3(local_path):
         return local_path, None
 
 
+async def _audio_duration_ms(local_path):
+    """استخراج مدة الملف فعلياً، حتى لا نرسل رسالة صوت بمدة صفر."""
+    if not local_path or not Path(local_path).is_file():
+        return 0
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return 0
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(local_path)],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        value = float((proc.stdout or "").strip() or 0)
+        return max(0, int(value * 1000))
+    except Exception:
+        return 0
+
+async def _validate_public_media_url(url, expected_kind="audio"):
+    """تأكد أن رابط Railway يعيد ملفاً فعلياً قبل إرساله إلى Giant Chat."""
+    if not url or not str(url).startswith(("http://", "https://")):
+        return False, "رابط الوسائط غير صالح"
+    try:
+        headers = {"Range": "bytes=0-4095", "User-Agent": "GiantChat-Bot/1.0"}
+        async with http.get(str(url), headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status not in (200, 206):
+                return False, f"رابط الوسائط أعاد HTTP {resp.status}"
+            ctype = str(resp.headers.get("Content-Type") or "").lower()
+            data = await resp.content.read(4096)
+            if len(data) < 256:
+                return False, "رابط الوسائط أعاد ملفاً فارغاً أو ناقصاً"
+            if expected_kind == "audio" and not (ctype.startswith("audio/") or "octet-stream" in ctype):
+                return False, f"نوع الملف غير صوتي: {ctype or 'unknown'}"
+            return True, None
+    except Exception as exc:
+        return False, f"تعذر فحص رابط الوسائط: {type(exc).__name__}: {exc}"
+
 async def _prepare_music_track(track, source_label):
     if not track:
         return None, "لم أجد المقطع المطلوب"
@@ -1627,11 +1664,25 @@ async def _prepare_music_track(track, source_label):
     if err:
         return None, err
     try:
+        if not local_path or not Path(local_path).is_file() or Path(local_path).stat().st_size <= 4096:
+            return None, "تم تنزيل الصوت لكن الملف فارغ أو تالف، لذلك لم يتم إرسال بصمة صوت."
         local_path, convert_err = await _convert_audio_to_mp3(local_path)
         if convert_err:
             log.warning(convert_err)
+        if not local_path or not Path(local_path).is_file() or Path(local_path).stat().st_size <= 4096:
+            return None, "فشل تجهيز ملف الصوت بعد التحويل؛ تم منع إرسال صوت فارغ."
+        duration_ms = await _audio_duration_ms(local_path)
+        if duration_ms <= 0:
+            duration_ms = int(float(track.get("duration") or 0) * 1000)
+        if duration_ms <= 0:
+            return None, "تعذر قراءة مدة الصوت؛ تم منع إرسال رسالة صوت غير صالحة."
         audio_url = await _store_media(local_path, "music")
+        valid, url_err = await _validate_public_media_url(audio_url, "audio")
+        if not valid:
+            return None, f"تم تجهيز الصوت لكن رابط التشغيل غير صالح: {url_err}"
         track["audio_url"] = audio_url
+        track["duration_ms"] = duration_ms
+        track["duration"] = duration_ms / 1000.0
         # MP3/WebM/M4A يحدد نوع الملف الذي أرسلناه، وvoice هو نوع رسالة Giant Chat.
         track["media_format"] = local_path.suffix.lower().lstrip(".")
         return track, None
@@ -1928,7 +1979,9 @@ async def play_track(rid, track, source_label, requester_id, requester_name):
     for target_rid in targets:
         try:
             await room_send(target_rid, caption)
-            duration_ms = int(float(track.get("duration") or 0) * 1000)
+            duration_ms = int(track.get("duration_ms") or (float(track.get("duration") or 0) * 1000))
+            if duration_ms <= 0:
+                raise RuntimeError("مدة الصوت صفر؛ تم منع إرسال بصمة صوت فارغة")
             await room_send_media(
                 target_rid,
                 f"▶️ تشغيل | {title}",
@@ -2732,12 +2785,13 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         "نرد": ("dice", 15, -10, 50, "🎲 فوز بالنرد!", "🎲 خسارة بالنرد..")
     }
     
-    # ألعاب الاختبار: لا تعمل إلا بعد تشغيلها من خاص المالك، ولا يراها المستخدمون العاديون.
+    # ألعاب الاختبار: لا تعمل إلا بعد تشغيلها من خاص المالك، والمالك يُتحقق منه
+    # بالـUID أو اسم الحساب عبر is_master() بدل مقارنة UID باسم مستخدم.
     active_tests = load_active_tests()
     testing_games = load_testing_games()
     if cmd in active_tests and cmd in testing_games:
-        if str(uid).strip().lower() != str(C.get("owner_username") or USERNAME).strip().lower():
-            return None
+        if not await is_master(uid, p_name):
+            return "🔐 لعبة الاختبار متاحة للمالك/الماستر فقط."
         custom = testing_games[cmd]
         cd_error = await require_game_cooldown(cmd)
         if cd_error:
