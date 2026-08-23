@@ -1,0 +1,19 @@
+{
+  "مليون": {
+    "command": "مليون",
+    "title": "لعبة مليون",
+    "status": "testing",
+    "open_test": true,
+    "cooldown_seconds": 120,
+    "win_chance": 50,
+    "win_points": 1000000,
+    "lose_points": 0,
+    "search_message": "🔎 جاري البحث عن مليون...",
+    "win_message": "🎉 تم الحصول على مليون!",
+    "lose_message": "😔 حظًا سعيدًا، جرب في المرة القادمة.",
+    "broadcast_on_win": true,
+    "local_asset": "assets/game_million_luxe.jpg",
+    "image_prompt": "بطاقة لعبة مليون فاخرة مع رقم مليون ومساحة لاسم الفائز",
+    "created_at": "2026-08-24T00:00:00Z"
+  }
+}
