@@ -25,7 +25,6 @@ alsfer_bot — بوت Giant Chat المطور
 import asyncio
 import json
 import logging
-import hmac
 import re
 import os
 import sys
@@ -378,49 +377,6 @@ LAST_HEARTBEAT_AT = 0.0
 LAST_DB_OK_AT = 0.0
 NETWORK_ONLINE = True
 
-
-# -----------------------------------------------------------------------------
-# Mobile Control API: keep this token only in the bot host environment.
-# The Android application never receives Supabase credentials or Giant password.
-# -----------------------------------------------------------------------------
-CONTROL_API_TOKEN = os.environ.get("BOT_CONTROL_TOKEN", "").strip()
-
-def _control_iso(timestamp):
-    if not timestamp:
-        return None
-    return datetime.fromtimestamp(float(timestamp), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-def _control_enabled(room_id):
-    return bool(load_moderation().get("enabled", {}).get(str(room_id), False))
-
-async def _control_user(username):
-    target = str(username or "").replace("@", "").strip()
-    if not target:
-        return None, "اسم المستخدم مطلوب."
-    rows, err = await table_select(
-        lambda: sb.table("profiles").select("id,username").eq("username", target).limit(1).execute()
-    )
-    if err:
-        return None, "تعذر البحث عن المستخدم."
-    if not rows:
-        return None, "المستخدم غير موجود."
-    return rows[0], None
-
-async def _control_room(room_id):
-    room_id = str(room_id or "").strip()
-    if not room_id:
-        return None, "معرف الغرفة مطلوب."
-    if room_id in rooms:
-        return {"id": room_id, "name": rooms[room_id]}, None
-    rows, err = await table_select(
-        lambda: sb.table("rooms").select("id,name").eq("id", room_id).limit(1).execute()
-    )
-    if err:
-        return None, "تعذر قراءة الغرفة."
-    if not rows:
-        return None, "الغرفة غير موجودة."
-    return rows[0], None
-
 # صور الألعاب PNG
 # كتالوج البوت المستقل: لا يقرأ جدول هدايا التطبيق ولا يعرض هداياه.
 # تبقى UUIDs هنا كمعرّفات داخلية فقط، ولا تظهر للمستخدم.
@@ -620,19 +576,16 @@ async def check_forbidden_word(rid, text):
 # [فلتر الكلمات] تنفيذ الحظر والطرد — بداية الدالة
 
 async def enforce_forbidden_word(rid, uid, username, matched_word):
-    """حظر فعلي عبر Giant RPC عند تطابق كلمة محظورة."""
-    uid = str(uid)
+    """حظر فعلي عند تطابق كلمة محظورة؛ لا يعلن النجاح إذا رفض Giant الطلب."""
     reason = f"فلتر الكلمات: {str(matched_word)[:180]}"
-    _, err = await rpc("ban_room_member", {"_room": rid, "_user": uid, "_reason": reason})
-    if err:
-        log.error("ban_room_member failed rid=%s uid=%s: %s", rid, uid, err)
-        return False, err
-
-    # يبقى السجل المحلي مساعدًا للرسائل اللاحقة فقط، أما الحظر الحقيقي ففي Giant.
+    ok, detail = await giant_moderate("ban", rid, str(uid), reason=reason)
+    if not ok:
+        log.error("forbidden-word moderation rejected rid=%s uid=%s: %s", rid, uid, detail)
+        return False, detail
     bans = load_bans()
     room_bans = bans.setdefault(str(rid), [])
-    if uid not in room_bans:
-        room_bans.append(uid)
+    if str(uid) not in room_bans:
+        room_bans.append(str(uid))
         save_bans(bans)
     return True, None
 
@@ -732,6 +685,160 @@ async def rpc(name, args):
     res, err = await run(lambda: sb.rpc(name, args).execute())
     if err: return None, err
     return getattr(res, "data", None), None
+
+
+# ----------------------------- Giant moderation -----------------------------
+GIANT_MANAGEMENT_RANKS = {"owner", "admin", "moderator"}
+GIANT_RANK_ALIASES = {
+    "مشرف": "moderator", "moderator": "moderator",
+    "ادمن": "admin", "أدمن": "admin", "admin": "admin",
+    "عضو": "member", "member": "member", "user": "member",
+}
+GIANT_PENDING_ACTIONS = {}
+GIANT_PENDING_TTL_SECONDS = 120
+GIANT_INTERACTIVE_COMMANDS = {
+    "طرد": ("kick", "طرد"),
+    "حظر": ("ban", "حظر"),
+    "اشراف": ("rank", "مشرف"),
+    "إشراف": ("rank", "مشرف"),
+    "مشرف": ("rank", "مشرف"),
+    "عضو": ("rank", "عضو"),
+    "ادمن": ("rank", "ادمن"),
+    "أدمن": ("rank", "ادمن"),
+    "مسؤول": ("rank", "ادمن"),
+}
+
+def giant_error_text(error):
+    """Return a compact message from Supabase/PostgREST without claiming success."""
+    text = str(error or "خطأ غير معروف").strip().replace("\n", " ")
+    return text[:360]
+
+async def giant_member_rank(room_id, user_id):
+    rows, err = await table_select(
+        lambda: sb.table("room_members").select("rank").eq("room_id", room_id).eq("user_id", user_id).limit(1).execute()
+    )
+    if err:
+        return None, f"تعذر قراءة رتبة العضو: {giant_error_text(err)}"
+    if not rows:
+        return None, "الحساب ليس عضوًا في هذه الغرفة."
+    return str(rows[0].get("rank") or "member").lower(), None
+
+async def giant_target(username):
+    clean = str(username or "").replace("@", "").strip()
+    if not clean:
+        return None, "اكتب اسم المستخدم بعد الأمر."
+    rows, err = await table_select(
+        lambda: sb.table("profiles").select("id,username").eq("username", clean).limit(1).execute()
+    )
+    if err:
+        return None, f"تعذر البحث عن المستخدم: {giant_error_text(err)}"
+    if not rows:
+        return None, "المستخدم غير موجود."
+    return rows[0], None
+
+async def giant_moderation_preflight(room_id, target_id=None):
+    if not BOT_ID:
+        return False, "البوت لم يسجل الدخول بعد."
+    bot_rank, bot_error = await giant_member_rank(room_id, BOT_ID)
+    if bot_error:
+        return False, f"تعذر تأكيد عضوية البوت: {bot_error}"
+    if bot_rank not in GIANT_MANAGEMENT_RANKS:
+        return False, f"رتبة البوت الحالية هي «{bot_rank}» ولا تسمح بالإدارة. رقِّ حساب البوت إلى مشرف أو أدمن داخل الغرفة."
+    if target_id:
+        target_rank, target_error = await giant_member_rank(room_id, target_id)
+        if target_error:
+            return False, f"لا يمكن إدارة هذا المستخدم: {target_error}"
+        if target_id == BOT_ID:
+            return False, "لا يمكن للبوت إدارة نفسه."
+    return True, bot_rank
+
+async def giant_moderate(action, room_id, target_id, reason="", new_rank=""):
+    """Execute the documented Giant RPC and return success only when RPC succeeds."""
+    allowed, detail = await giant_moderation_preflight(room_id, target_id)
+    if not allowed:
+        return False, detail
+    if action == "kick":
+        _, err = await rpc("kick_room_member", {"_room": room_id, "_user": target_id})
+    elif action == "ban":
+        _, err = await rpc("ban_room_member", {"_room": room_id, "_user": target_id, "_reason": str(reason or "إجراء إداري عبر البوت")[:240]})
+    elif action == "rank":
+        if new_rank not in {"member", "moderator", "admin"}:
+            return False, "الرتبة غير صالحة. استخدم: عضو، مشرف، أو ادمن."
+        _, err = await rpc("set_member_rank", {"_room": room_id, "_user": target_id, "_new_rank": new_rank})
+    else:
+        return False, "إجراء إداري غير مدعوم."
+    if err:
+        return False, f"رفض Giant الإجراء: {giant_error_text(err)}"
+    return True, detail
+
+def giant_promotion_args(argument):
+    parts = [part.strip().replace("@", "") for part in str(argument or "").split() if part.strip()]
+    if len(parts) < 2:
+        return None, None
+    first, last = parts[0].lower(), parts[-1].lower()
+    if first in GIANT_RANK_ALIASES:
+        return parts[1], GIANT_RANK_ALIASES[first]
+    if last in GIANT_RANK_ALIASES:
+        return parts[0], GIANT_RANK_ALIASES[last]
+    return None, None
+
+def giant_interactive_action(text):
+    return GIANT_INTERACTIVE_COMMANDS.get(str(text or "").strip())
+
+def giant_interactive_prompt(label):
+    return f"✍️ أرسل الآن اسم المستخدم لتنفيذ إجراء «{label}» خلال دقيقتين، أو اكتب إلغاء."
+
+async def giant_begin_interactive(room_id, user_id, action, label):
+    GIANT_PENDING_ACTIONS[(str(room_id), str(user_id))] = {
+        "action": action, "label": label, "created_at": time.time()
+    }
+    return giant_interactive_prompt(label)
+
+async def giant_consume_interactive(room_id, user_id, username, text):
+    key = (str(room_id), str(user_id))
+    pending = GIANT_PENDING_ACTIONS.get(key)
+    if not pending:
+        return None
+    if time.time() - float(pending.get("created_at", 0)) > GIANT_PENDING_TTL_SECONDS:
+        GIANT_PENDING_ACTIONS.pop(key, None)
+        return "⌛ انتهت مهلة الأمر. اكتب الأمر من جديد."
+    normalized = str(text or "").strip()
+    if normalized.lower() in ("الغاء", "إلغاء", "cancel", "وقف"):
+        GIANT_PENDING_ACTIONS.pop(key, None)
+        return "🛑 تم إلغاء الأمر."
+    if not await is_master(user_id, username):
+        GIANT_PENDING_ACTIONS.pop(key, None)
+        return "🚫 للماستر فقط."
+    profile, profile_error = await giant_target(normalized)
+    if profile_error:
+        return f"❌ {profile_error} أرسل اسمًا صحيحًا أو اكتب إلغاء."
+    action = pending.get("action")
+    label = pending.get("label") or "تعديله"
+    if action == "kick":
+        ok, detail = await giant_moderate("kick", room_id, str(profile["id"]))
+    elif action == "ban":
+        ok, detail = await giant_moderate("ban", room_id, str(profile["id"]), reason="حظر تفاعلي عبر البوت")
+    elif action == "rank":
+        new_rank = GIANT_RANK_ALIASES.get(label, "")
+        ok, detail = await giant_moderate("rank", room_id, str(profile["id"]), new_rank=new_rank)
+    else:
+        GIANT_PENDING_ACTIONS.pop(key, None)
+        return "❌ حالة أمر غير معروفة."
+    if not ok:
+        GIANT_PENDING_ACTIONS.pop(key, None)
+        return f"❌ تعذر {label} @{profile.get('username') or normalized}: {detail}"
+    GIANT_PENDING_ACTIONS.pop(key, None)
+    if action == "kick":
+        return message("moderation.kick", "👞 تم طرد @{name}.", name=profile.get("username") or normalized)
+    if action == "ban":
+        bans = load_bans()
+        room_bans = bans.setdefault(str(room_id), [])
+        if str(profile["id"]) not in room_bans:
+            room_bans.append(str(profile["id"]))
+            save_bans(bans)
+        return message("moderation.ban", "🚫 تم حظر @{name}.", name=profile.get("username") or normalized)
+    return f"✅ تم تعيين @{profile.get('username') or normalized} برتبة {label}."
+
 
 async def username_of(uid):
     rows, _ = await table_select(lambda: sb.table("profiles").select("username").eq("id", uid).limit(1).execute())
@@ -1689,136 +1796,6 @@ async def start_media_server():
     app.router.add_get("/games/{name}", game_handler)
     app.router.add_get("/published/{name}", published_handler)
     app.router.add_post("/webhook", social_webhook)
-
-
-    # -------------------------------------------------------------------------
-    # Mobile Control API. It remains disabled until BOT_CONTROL_TOKEN exists.
-    # All state changes reuse bot.py helpers and the same Giant session.
-    # -------------------------------------------------------------------------
-    async def control_authorized(request):
-        if not CONTROL_API_TOKEN:
-            raise web.HTTPServiceUnavailable(text="BOT_CONTROL_TOKEN is not configured")
-        provided = request.headers.get("Authorization", "")
-        expected = f"Bearer {CONTROL_API_TOKEN}"
-        if not hmac.compare_digest(provided, expected):
-            raise web.HTTPUnauthorized(text="invalid control token")
-
-    async def control_payload(request):
-        await control_authorized(request)
-        try:
-            payload = await request.json()
-        except Exception:
-            raise web.HTTPBadRequest(text="invalid json")
-        if not isinstance(payload, dict):
-            raise web.HTTPBadRequest(text="json object required")
-        return payload
-
-    async def control_health(request):
-        await control_authorized(request)
-        ready = bool(BOT_ID)
-        return web.json_response({
-            "ok": ready,
-            "status": "online" if ready and NETWORK_ONLINE else "offline",
-            "botUsername": USERNAME if ready else None,
-            "joinedRooms": len(rooms),
-            "lastHeartbeatAt": _control_iso(LAST_HEARTBEAT_AT),
-            "detail": "البوت متصل وجاهز للتحكم." if ready and NETWORK_ONLINE else "البوت لم يكمل الاتصال أو أن الشبكة غير متاحة.",
-        }, status=200 if ready else 503)
-
-    async def control_rooms(request):
-        await control_authorized(request)
-        return web.json_response({"ok": True, "rooms": [
-            {"id": str(room_id), "name": name, "active": True, "moderationEnabled": _control_enabled(room_id)}
-            for room_id, name in rooms.items()
-        ]})
-
-    async def control_join(request):
-        payload = await control_payload(request)
-        name = str(payload.get("room") or "").strip()
-        if not name:
-            return web.json_response({"ok": False, "error": "اسم الغرفة مطلوب."}, status=400)
-        ok, detail = await join(name)
-        return web.json_response({"ok": bool(ok), "detail": detail}, status=200 if ok else 400)
-
-    async def control_leave(request):
-        payload = await control_payload(request)
-        room, error = await _control_room(payload.get("roomId"))
-        if error:
-            return web.json_response({"ok": False, "error": error}, status=400)
-        _, rpc_error = await rpc("room_leave", {"_room": room["id"]})
-        if rpc_error:
-            return web.json_response({"ok": False, "error": str(rpc_error)}, status=400)
-        rooms.pop(room["id"], None)
-        last_room.pop(room["id"], None)
-        saved = load_rooms_saved()
-        saved.pop(room["id"], None)
-        save_rooms_saved(saved)
-        return web.json_response({"ok": True, "detail": f"تم خروج البوت من {room['name']}."})
-
-    async def control_get_moderation(request):
-        await control_authorized(request)
-        room, error = await _control_room(request.query.get("roomId"))
-        if error:
-            return web.json_response({"ok": False, "error": error}, status=400)
-        mod = load_moderation()
-        return web.json_response({
-            "ok": True,
-            "roomId": str(room["id"]),
-            "enabled": bool(mod.get("enabled", {}).get(str(room["id"]), False)),
-            "words": mod.get("words", []) if isinstance(mod.get("words", []), list) else [],
-        })
-
-    async def control_put_moderation(request):
-        payload = await control_payload(request)
-        room, error = await _control_room(payload.get("roomId"))
-        if error:
-            return web.json_response({"ok": False, "error": error}, status=400)
-        words = payload.get("words", [])
-        if not isinstance(words, list) or any(not isinstance(word, str) for word in words):
-            return web.json_response({"ok": False, "error": "words يجب أن تكون قائمة نصوص."}, status=400)
-        cleaned_words = list(dict.fromkeys(word.strip() for word in words if word.strip()))[:500]
-        mod = load_moderation()
-        enabled = mod.setdefault("enabled", {})
-        enabled[str(room["id"])] = bool(payload.get("enabled", False))
-        mod["words"] = cleaned_words
-        save_moderation(mod)
-        return web.json_response({"ok": True, "roomId": str(room["id"]), "enabled": enabled[str(room["id"])], "words": cleaned_words})
-
-    async def control_action(request):
-        payload = await control_payload(request)
-        action = request.match_info.get("action")
-        if action not in ("kick", "ban"):
-            return web.json_response({"ok": False, "error": "إجراء غير مسموح."}, status=404)
-        room, room_error = await _control_room(payload.get("roomId"))
-        if room_error:
-            return web.json_response({"ok": False, "error": room_error}, status=400)
-        user, user_error = await _control_user(payload.get("username"))
-        if user_error:
-            return web.json_response({"ok": False, "error": user_error}, status=400)
-        user_id = str(user["id"])
-        if action == "ban":
-            reason = str(payload.get("reason") or "إجراء إداري عبر لوحة التحكم")[:240]
-            _, rpc_error = await rpc("ban_room_member", {"_room": room["id"], "_user": user_id, "_reason": reason})
-        else:
-            _, rpc_error = await rpc("kick_room_member", {"_room": room["id"], "_user": user_id})
-        if rpc_error:
-            return web.json_response({"ok": False, "error": str(rpc_error)}, status=400)
-        if action == "ban":
-            bans = load_bans()
-            members = bans.setdefault(str(room["id"]), [])
-            if user_id not in members:
-                members.append(user_id)
-                save_bans(bans)
-        label = "حظر" if action == "ban" else "طرد"
-        return web.json_response({"ok": True, "detail": f"تم {label} @{user.get('username') or payload.get('username')} من الغرفة."})
-
-    app.router.add_get("/control/health", control_health)
-    app.router.add_get("/control/rooms", control_rooms)
-    app.router.add_post("/control/rooms/join", control_join)
-    app.router.add_post("/control/rooms/leave", control_leave)
-    app.router.add_get("/control/moderation", control_get_moderation)
-    app.router.add_put("/control/moderation", control_put_moderation)
-    app.router.add_post("/control/actions/{action}", control_action)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     media_runner = runner
@@ -2460,13 +2437,22 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     admin_prefixes = ("+mf@", "-mf@", "clear@mf", "l@mf", "mf@on", "mf@off",
                       "+wc ", "clear@wc", "l@wc", "wc@on", "wc@off", "mas@")
     if not lower_text.startswith(admin_prefixes):
+        interactive = giant_interactive_action(lower_text)
+        if interactive:
+            if not await is_master(uid, p_name):
+                return "🚫 للماستر فقط."
+            return await giant_begin_interactive(rid, uid, interactive[0], interactive[1])
+
+        interactive_reply = await giant_consume_interactive(rid, uid, p_name, text)
+        if interactive_reply is not None:
+            return interactive_reply
+
         matched_word = await check_forbidden_word(rid, text)
         if matched_word:
-            kicked, kick_error = await enforce_forbidden_word(rid, uid, p_name, matched_word)
-            if kicked:
-                return message("moderation.filtered_ban", "🚫 تم الحظر بسبب الاساءه.")
-            # الحظر المحلي يبقى فعالاً حتى لو كان خادم الغرفة رفض عملية الطرد مؤقتاً.
-            return message("moderation.filtered_ban", "🚫 تم الحظر بسبب الاساءه.") + "\n⚠️ تعذر تنفيذ الطرد من الغرفة حالياً."
+            banned, ban_error = await enforce_forbidden_word(rid, uid, p_name, matched_word)
+            if banned:
+                return message("moderation.filtered_ban", "🚫 تم حظر الحساب فعلياً بسبب كلمة محظورة.")
+            return f"⚠️ اكتشف الفلتر كلمة محظورة لكنه لم يتمكن من حظر الحساب فعلياً. السبب: {ban_error}"
 
     # ---------------- الذكاء الاصطناعي داخل الغرفة ----------------
     # يدعم ai@السؤال وذكاء@السؤال، وكذلك التحيات المباشرة البسيطة.
@@ -2998,29 +2984,47 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
 # [لعبة مضاربة] END
 
 
+    if cmd in ("صلاحياتي", "modstatus"):
+        rank, rank_error = await giant_member_rank(rid, BOT_ID)
+        master = await is_master(uid, p_name)
+        if rank_error:
+            return f"❌ حالة إدارة البوت: {rank_error}"
+        return f"🤖 رتبة البوت في الغرفة: {rank}\n👤 لديك صلاحية ماستر للبوت: {'نعم' if master else 'لا'}"
+
     if cmd in ("طرد", "kick"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
-        target = arg.replace("@", "").strip()
-        rows, _ = await table_select(lambda: sb.table("profiles").select("id").eq("username", target).limit(1).execute())
-        if not rows: return "❌ المستخدم غير موجود."
-        _, err = await rpc("kick_room_member", {"_room": rid, "_user": rows[0]["id"]})
-        if err: return f"❌ تعذر الطرد: {err}"
-        return message("moderation.kick", "👞 تم طرد @{name}.", name=target)
+        profile, profile_error = await giant_target(arg)
+        if profile_error: return f"❌ {profile_error}"
+        ok, detail = await giant_moderate("kick", rid, str(profile["id"]))
+        if not ok: return f"❌ تعذر الطرد: {detail}"
+        return message("moderation.kick", "👞 تم طرد @{name}.", name=profile.get("username") or arg)
 
     if cmd in ("حظر", "ban"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
-        target = arg.replace("@", "").strip()
-        rows, _ = await table_select(lambda: sb.table("profiles").select("id").eq("username", target).limit(1).execute())
-        if not rows: return "❌ المستخدم غير موجود."
-        tid = str(rows[0]["id"])
-        _, err = await rpc("ban_room_member", {"_room": rid, "_user": tid, "_reason": "إجراء ماستر عبر البوت"})
-        if err: return f"❌ تعذر الحظر: {err}"
+        profile, profile_error = await giant_target(arg)
+        if profile_error: return f"❌ {profile_error}"
+        ok, detail = await giant_moderate("ban", rid, str(profile["id"]), reason="إجراء ماستر عبر البوت")
+        if not ok: return f"❌ تعذر الحظر: {detail}"
         bans = load_bans()
         room_bans = bans.setdefault(str(rid), [])
-        if tid not in room_bans:
-            room_bans.append(tid)
+        if str(profile["id"]) not in room_bans:
+            room_bans.append(str(profile["id"]))
             save_bans(bans)
-        return message("moderation.ban", "🚫 تم حظر @{name}.", name=target)
+        return message("moderation.ban", "🚫 تم حظر @{name}.", name=profile.get("username") or arg)
+
+    if cmd in ("ترقية", "ترقي", "رفع", "promote", "تنزيل", "demote"):
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        target_name, new_rank = giant_promotion_args(arg)
+        if cmd in ("تنزيل", "demote") and arg.strip() and not new_rank:
+            target_name, new_rank = arg.strip().replace("@", ""), "member"
+        if not target_name or not new_rank:
+            return "❌ الصيغة: ترقية @اسم مشرف | ترقية @اسم ادمن | تنزيل @اسم"
+        profile, profile_error = await giant_target(target_name)
+        if profile_error: return f"❌ {profile_error}"
+        ok, detail = await giant_moderate("rank", rid, str(profile["id"]), new_rank=new_rank)
+        if not ok: return f"❌ تعذر تغيير الرتبة: {detail}"
+        labels = {"member": "عضو", "moderator": "مشرف", "admin": "ادمن"}
+        return f"✅ تم تعيين @{profile.get('username') or target_name} برتبة {labels[new_rank]}."
 
     if cmd == "نقاطي":
         p, d = get_user_data(uid, p_name)
