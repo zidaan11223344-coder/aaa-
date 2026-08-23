@@ -25,6 +25,7 @@ alsfer_bot — بوت Giant Chat المطور
 import asyncio
 import json
 import logging
+import hmac
 import re
 import os
 import sys
@@ -88,6 +89,7 @@ POINTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "points.j
 GIFT_POINTS_LOCK = asyncio.Lock()
 REPLIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "replies.json")
 MASTERS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "masters.json")
+BANS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bans.json")
 MESSAGES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "messages.json")
 ROOMS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rooms.json")
 MODERATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moderation.json")
@@ -376,6 +378,49 @@ LAST_HEARTBEAT_AT = 0.0
 LAST_DB_OK_AT = 0.0
 NETWORK_ONLINE = True
 
+
+# -----------------------------------------------------------------------------
+# Mobile Control API: keep this token only in the bot host environment.
+# The Android application never receives Supabase credentials or Giant password.
+# -----------------------------------------------------------------------------
+CONTROL_API_TOKEN = os.environ.get("BOT_CONTROL_TOKEN", "").strip()
+
+def _control_iso(timestamp):
+    if not timestamp:
+        return None
+    return datetime.fromtimestamp(float(timestamp), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _control_enabled(room_id):
+    return bool(load_moderation().get("enabled", {}).get(str(room_id), False))
+
+async def _control_user(username):
+    target = str(username or "").replace("@", "").strip()
+    if not target:
+        return None, "اسم المستخدم مطلوب."
+    rows, err = await table_select(
+        lambda: sb.table("profiles").select("id,username").eq("username", target).limit(1).execute()
+    )
+    if err:
+        return None, "تعذر البحث عن المستخدم."
+    if not rows:
+        return None, "المستخدم غير موجود."
+    return rows[0], None
+
+async def _control_room(room_id):
+    room_id = str(room_id or "").strip()
+    if not room_id:
+        return None, "معرف الغرفة مطلوب."
+    if room_id in rooms:
+        return {"id": room_id, "name": rooms[room_id]}, None
+    rows, err = await table_select(
+        lambda: sb.table("rooms").select("id,name").eq("id", room_id).limit(1).execute()
+    )
+    if err:
+        return None, "تعذر قراءة الغرفة."
+    if not rows:
+        return None, "الغرفة غير موجودة."
+    return rows[0], None
+
 # صور الألعاب PNG
 # كتالوج البوت المستقل: لا يقرأ جدول هدايا التطبيق ولا يعرض هداياه.
 # تبقى UUIDs هنا كمعرّفات داخلية فقط، ولا تظهر للمستخدم.
@@ -447,6 +492,7 @@ def load_replies(): return load_json(REPLIES_PATH, {})
 def save_replies(r): save_json(REPLIES_PATH, r)
 def load_masters(): return load_json(MASTERS_PATH, [])
 def save_masters(m): save_json(MASTERS_PATH, m)
+def load_bans(): return load_json(BANS_PATH, {})
 
 def load_messages():
     return load_json(MESSAGES_PATH, {})
@@ -464,6 +510,7 @@ def message(key, default="", **kwargs):
         return template.format(**kwargs)
     except Exception:
         return template
+def save_bans(b): save_json(BANS_PATH, b)
 def load_rooms_saved(): return load_json(ROOMS_PATH, {})
 def save_rooms_saved(r): save_json(ROOMS_PATH, r)
 def load_moderation(): return load_json(MODERATION_PATH, {"enabled": {}, "words": []})
@@ -573,25 +620,21 @@ async def check_forbidden_word(rid, text):
 # [فلتر الكلمات] تنفيذ الحظر والطرد — بداية الدالة
 
 async def enforce_forbidden_word(rid, uid, username, matched_word):
-    """حظر فعلي في الغرفة عبر RPC الرسمي؛ لا يوجد تخزين للحظر داخل البوت."""
-    last_error = None
-    for attempt in range(3):
-        _, err = await rpc("ban_room_member", {
-            "_room": rid,
-            "_user": str(uid),
-            "_reason": f"الكلمة المحظورة: {matched_word}",
-        })
-        if not err:
-            return True, None
-        last_error = err
-        await asyncio.sleep(0.35 * (attempt + 1))
+    """حظر فعلي عبر Giant RPC عند تطابق كلمة محظورة."""
+    uid = str(uid)
+    reason = f"فلتر الكلمات: {str(matched_word)[:180]}"
+    _, err = await rpc("ban_room_member", {"_room": rid, "_user": uid, "_reason": reason})
+    if err:
+        log.error("ban_room_member failed rid=%s uid=%s: %s", rid, uid, err)
+        return False, err
 
-    log.error(
-        "forbidden-word ban_room_member failed rid=%s uid=%s: %s",
-        rid, uid, last_error
-    )
-    return False, last_error
-
+    # يبقى السجل المحلي مساعدًا للرسائل اللاحقة فقط، أما الحظر الحقيقي ففي Giant.
+    bans = load_bans()
+    room_bans = bans.setdefault(str(rid), [])
+    if uid not in room_bans:
+        room_bans.append(uid)
+        save_bans(bans)
+    return True, None
 
 async def all_room_ids():
     """Return every room visible to the bot, not only rooms currently cached."""
@@ -635,19 +678,8 @@ async def game_cooldown(uid, username):
     return check_cooldown(uid, username, "game", seconds)
 
 async def is_banned(rid, uid):
-    """فحص الحظر من قائمة الغرفة الحقيقية في التطبيق، وليس من ملف البوت."""
-    rows, err = await table_select(
-        lambda: sb.table("room_bans")
-        .select("user_id")
-        .eq("room_id", rid)
-        .eq("user_id", uid)
-        .limit(1)
-        .execute()
-    )
-    if err:
-        log.warning("room_bans check failed rid=%s uid=%s: %s", rid, uid, err)
-        return False
-    return bool(rows)
+    bans = load_bans()
+    return uid in bans.get(rid, [])
 
 async def is_master(uid, username):
     if username.lower() == OWNER: return True
@@ -1657,6 +1689,136 @@ async def start_media_server():
     app.router.add_get("/games/{name}", game_handler)
     app.router.add_get("/published/{name}", published_handler)
     app.router.add_post("/webhook", social_webhook)
+
+
+    # -------------------------------------------------------------------------
+    # Mobile Control API. It remains disabled until BOT_CONTROL_TOKEN exists.
+    # All state changes reuse bot.py helpers and the same Giant session.
+    # -------------------------------------------------------------------------
+    async def control_authorized(request):
+        if not CONTROL_API_TOKEN:
+            raise web.HTTPServiceUnavailable(text="BOT_CONTROL_TOKEN is not configured")
+        provided = request.headers.get("Authorization", "")
+        expected = f"Bearer {CONTROL_API_TOKEN}"
+        if not hmac.compare_digest(provided, expected):
+            raise web.HTTPUnauthorized(text="invalid control token")
+
+    async def control_payload(request):
+        await control_authorized(request)
+        try:
+            payload = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text="invalid json")
+        if not isinstance(payload, dict):
+            raise web.HTTPBadRequest(text="json object required")
+        return payload
+
+    async def control_health(request):
+        await control_authorized(request)
+        ready = bool(BOT_ID)
+        return web.json_response({
+            "ok": ready,
+            "status": "online" if ready and NETWORK_ONLINE else "offline",
+            "botUsername": USERNAME if ready else None,
+            "joinedRooms": len(rooms),
+            "lastHeartbeatAt": _control_iso(LAST_HEARTBEAT_AT),
+            "detail": "البوت متصل وجاهز للتحكم." if ready and NETWORK_ONLINE else "البوت لم يكمل الاتصال أو أن الشبكة غير متاحة.",
+        }, status=200 if ready else 503)
+
+    async def control_rooms(request):
+        await control_authorized(request)
+        return web.json_response({"ok": True, "rooms": [
+            {"id": str(room_id), "name": name, "active": True, "moderationEnabled": _control_enabled(room_id)}
+            for room_id, name in rooms.items()
+        ]})
+
+    async def control_join(request):
+        payload = await control_payload(request)
+        name = str(payload.get("room") or "").strip()
+        if not name:
+            return web.json_response({"ok": False, "error": "اسم الغرفة مطلوب."}, status=400)
+        ok, detail = await join(name)
+        return web.json_response({"ok": bool(ok), "detail": detail}, status=200 if ok else 400)
+
+    async def control_leave(request):
+        payload = await control_payload(request)
+        room, error = await _control_room(payload.get("roomId"))
+        if error:
+            return web.json_response({"ok": False, "error": error}, status=400)
+        _, rpc_error = await rpc("room_leave", {"_room": room["id"]})
+        if rpc_error:
+            return web.json_response({"ok": False, "error": str(rpc_error)}, status=400)
+        rooms.pop(room["id"], None)
+        last_room.pop(room["id"], None)
+        saved = load_rooms_saved()
+        saved.pop(room["id"], None)
+        save_rooms_saved(saved)
+        return web.json_response({"ok": True, "detail": f"تم خروج البوت من {room['name']}."})
+
+    async def control_get_moderation(request):
+        await control_authorized(request)
+        room, error = await _control_room(request.query.get("roomId"))
+        if error:
+            return web.json_response({"ok": False, "error": error}, status=400)
+        mod = load_moderation()
+        return web.json_response({
+            "ok": True,
+            "roomId": str(room["id"]),
+            "enabled": bool(mod.get("enabled", {}).get(str(room["id"]), False)),
+            "words": mod.get("words", []) if isinstance(mod.get("words", []), list) else [],
+        })
+
+    async def control_put_moderation(request):
+        payload = await control_payload(request)
+        room, error = await _control_room(payload.get("roomId"))
+        if error:
+            return web.json_response({"ok": False, "error": error}, status=400)
+        words = payload.get("words", [])
+        if not isinstance(words, list) or any(not isinstance(word, str) for word in words):
+            return web.json_response({"ok": False, "error": "words يجب أن تكون قائمة نصوص."}, status=400)
+        cleaned_words = list(dict.fromkeys(word.strip() for word in words if word.strip()))[:500]
+        mod = load_moderation()
+        enabled = mod.setdefault("enabled", {})
+        enabled[str(room["id"])] = bool(payload.get("enabled", False))
+        mod["words"] = cleaned_words
+        save_moderation(mod)
+        return web.json_response({"ok": True, "roomId": str(room["id"]), "enabled": enabled[str(room["id"])], "words": cleaned_words})
+
+    async def control_action(request):
+        payload = await control_payload(request)
+        action = request.match_info.get("action")
+        if action not in ("kick", "ban"):
+            return web.json_response({"ok": False, "error": "إجراء غير مسموح."}, status=404)
+        room, room_error = await _control_room(payload.get("roomId"))
+        if room_error:
+            return web.json_response({"ok": False, "error": room_error}, status=400)
+        user, user_error = await _control_user(payload.get("username"))
+        if user_error:
+            return web.json_response({"ok": False, "error": user_error}, status=400)
+        user_id = str(user["id"])
+        if action == "ban":
+            reason = str(payload.get("reason") or "إجراء إداري عبر لوحة التحكم")[:240]
+            _, rpc_error = await rpc("ban_room_member", {"_room": room["id"], "_user": user_id, "_reason": reason})
+        else:
+            _, rpc_error = await rpc("kick_room_member", {"_room": room["id"], "_user": user_id})
+        if rpc_error:
+            return web.json_response({"ok": False, "error": str(rpc_error)}, status=400)
+        if action == "ban":
+            bans = load_bans()
+            members = bans.setdefault(str(room["id"]), [])
+            if user_id not in members:
+                members.append(user_id)
+                save_bans(bans)
+        label = "حظر" if action == "ban" else "طرد"
+        return web.json_response({"ok": True, "detail": f"تم {label} @{user.get('username') or payload.get('username')} من الغرفة."})
+
+    app.router.add_get("/control/health", control_health)
+    app.router.add_get("/control/rooms", control_rooms)
+    app.router.add_post("/control/rooms/join", control_join)
+    app.router.add_post("/control/rooms/leave", control_leave)
+    app.router.add_get("/control/moderation", control_get_moderation)
+    app.router.add_put("/control/moderation", control_put_moderation)
+    app.router.add_post("/control/actions/{action}", control_action)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     media_runner = runner
@@ -2839,63 +3001,26 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if cmd in ("طرد", "kick"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
         target = arg.replace("@", "").strip()
-        if not target: return "❌ الصيغة: طرد @اسم_المستخدم"
-        rows, _ = await table_select(
-            lambda: sb.table("profiles").select("id").eq("username", target).limit(1).execute()
-        )
+        rows, _ = await table_select(lambda: sb.table("profiles").select("id").eq("username", target).limit(1).execute())
         if not rows: return "❌ المستخدم غير موجود."
-
-        tid = str(rows[0]["id"])
-        _, err = await rpc("kick_room_member", {"_room": rid, "_user": tid})
-        if err:
-            log.error("kick_room_member failed rid=%s uid=%s: %s", rid, tid, err)
-            return f"❌ فشل الطرد الحقيقي: {err}"
+        _, err = await rpc("kick_room_member", {"_room": rid, "_user": rows[0]["id"]})
+        if err: return f"❌ تعذر الطرد: {err}"
         return message("moderation.kick", "👞 تم طرد @{name}.", name=target)
 
     if cmd in ("حظر", "ban"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
         target = arg.replace("@", "").strip()
-        if not target: return "❌ الصيغة: حظر @اسم_المستخدم"
-        rows, _ = await table_select(
-            lambda: sb.table("profiles").select("id,username").eq("username", target).limit(1).execute()
-        )
+        rows, _ = await table_select(lambda: sb.table("profiles").select("id").eq("username", target).limit(1).execute())
         if not rows: return "❌ المستخدم غير موجود."
-
         tid = str(rows[0]["id"])
-        real_name = rows[0].get("username") or target
-
-        # المصدر الوحيد للحظر هو نظام الغرفة نفسه:
-        # ban_room_member يضيف المستخدم إلى room_bans ويزيله من الغرفة.
-        _, err = await rpc("ban_room_member", {
-            "_room": rid,
-            "_user": tid,
-            "_reason": f"حظر بواسطة الماستر @{p_name}",
-        })
-        if err:
-            log.error("ban_room_member failed rid=%s uid=%s: %s", rid, tid, err)
-            return f"❌ فشل الحظر الحقيقي من الغرفة: {err}"
-
-        # تحقق من أن الاسم ظهر فعلياً في قائمة حظر الغرفة.
-        verify_rows, verify_err = await table_select(
-            lambda: sb.table("room_bans")
-            .select("user_id")
-            .eq("room_id", rid)
-            .eq("user_id", tid)
-            .limit(1)
-            .execute()
-        )
-        if verify_err or not verify_rows:
-            log.error(
-                "ban RPC succeeded but room_bans verification failed rid=%s uid=%s err=%s",
-                rid, tid, verify_err
-            )
-            return "⚠️ تم تنفيذ طلب الحظر، لكن تعذر التحقق من ظهوره في قائمة محظوري الغرفة."
-
-        return message(
-            "moderation.ban",
-            "🚫 تم حظر @{name} من الغرفة وإضافته إلى قائمة المحظورين.",
-            name=real_name
-        )
+        _, err = await rpc("ban_room_member", {"_room": rid, "_user": tid, "_reason": "إجراء ماستر عبر البوت"})
+        if err: return f"❌ تعذر الحظر: {err}"
+        bans = load_bans()
+        room_bans = bans.setdefault(str(rid), [])
+        if tid not in room_bans:
+            room_bans.append(tid)
+            save_bans(bans)
+        return message("moderation.ban", "🚫 تم حظر @{name}.", name=target)
 
     if cmd == "نقاطي":
         p, d = get_user_data(uid, p_name)
@@ -3708,7 +3833,7 @@ def self_repair_sync():
     results=[]
     for path, default in [
         (CONFIG_PATH, dict(C)), (POINTS_PATH, {}), (REPLIES_PATH, {}), (MASTERS_PATH, []),
-        (ROOMS_PATH, {}), (MODERATION_PATH, {"enabled":{},"words":[]}),
+        (BANS_PATH, {}), (ROOMS_PATH, {}), (MODERATION_PATH, {"enabled":{},"words":[]}),
         (WELCOME_PATH, {}), (PUBLISHED_POSTS_PATH, {}), (SOCIAL_EVENTS_PATH, {}),
         (VIP_USERS_PATH, {}), (CUSTOM_GAMES_PATH, {}), (CUSTOM_COMMANDS_PATH, {}),
         (TESTING_GAMES_PATH, {}), (TESTING_STATE_PATH, {}),
