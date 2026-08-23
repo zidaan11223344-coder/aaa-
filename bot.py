@@ -754,13 +754,16 @@ async def giant_moderation_preflight(room_id, target_id=None):
 
 async def giant_moderate(action, room_id, target_id, reason="", new_rank=""):
     """Execute the documented Giant RPC and return success only when RPC succeeds."""
-    allowed, detail = await giant_moderation_preflight(room_id, target_id)
+    # العضو المحظور قد لا يبقى في room_members، لذلك لا نطلب عضويته عند فك الحظر.
+    allowed, detail = await giant_moderation_preflight(room_id, None if action == "unban" else target_id)
     if not allowed:
         return False, detail
     if action == "kick":
         _, err = await rpc("kick_room_member", {"_room": room_id, "_user": target_id})
     elif action == "ban":
         _, err = await rpc("ban_room_member", {"_room": room_id, "_user": target_id, "_reason": str(reason or "إجراء إداري عبر البوت")[:240]})
+    elif action == "unban":
+        _, err = await rpc("unban_room_member", {"_room": room_id, "_user": target_id})
     elif action == "rank":
         if new_rank not in {"member", "moderator", "admin"}:
             return False, "الرتبة غير صالحة. استخدم: عضو، مشرف، أو ادمن."
@@ -2436,7 +2439,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
 
     admin_prefixes = ("+mf@", "-mf@", "clear@mf", "l@mf", "mf@on", "mf@off",
                       "+wc ", "clear@wc", "l@wc", "wc@on", "wc@off", "mas@")
-    if not lower_text.startswith(admin_prefixes):
+    if not lower_text.startswith(admin_prefixes + ("b@", "ban@", "ub@", "unban@", "mf@status", "mf status")):
         interactive = giant_interactive_action(lower_text)
         if interactive:
             if not await is_master(uid, p_name):
@@ -2642,11 +2645,16 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if lower_text in ("mf@on", "mf on"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
         mod = load_moderation(); mod.setdefault("enabled", {})[str(rid)] = True; save_moderation(mod)
-        return "✅ تم تفعيل فلتر الألفاظ في هذه الغرفة."
+        return "✅ تم تفعيل فلتر الألفاظ والحظر الفعلي في هذه الغرفة."
     if lower_text in ("mf@off", "mf off"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
         mod = load_moderation(); mod.setdefault("enabled", {})[str(rid)] = False; save_moderation(mod)
         return "⛔ تم تعطيل فلتر الألفاظ في هذه الغرفة."
+    if lower_text in ("mf@status", "mf status"):
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        mod = load_moderation()
+        active = mod.get("enabled", {}).get(str(rid), False)
+        return f"🛡️ فلتر الكلمات: {'مفعّل' if active else 'متوقف'}\n🚫 الكلمات المسجلة: {len(mod.get('words', []))}"
     if lower_text == "clear@mf":
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
         mod = load_moderation(); mod["words"] = []; save_moderation(mod)
@@ -2661,8 +2669,10 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if not word: return "❌ الصيغة: +mf@كلمة"
         mod = load_moderation(); words = mod.setdefault("words", [])
         if word not in words: words.append(word)
+        mod.setdefault("enabled", {})[str(rid)] = True
         save_moderation(mod)
-        return f"✅ تمت إضافة الكلمة الممنوعة: {word}"
+        return f"✅ تمت إضافة الكلمة وتفعيل فلتر الحظر لهذه الغرفة: {word}"
+
     if lower_text.startswith("-mf@"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
         word = text.split("@", 1)[1].strip()
@@ -2990,6 +3000,34 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if rank_error:
             return f"❌ حالة إدارة البوت: {rank_error}"
         return f"🤖 رتبة البوت في الغرفة: {rank}\n👤 لديك صلاحية ماستر للبوت: {'نعم' if master else 'لا'}"
+
+    if lower_text.startswith(("b@", "ban@")):
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        target = text.split("@", 1)[1].strip() if "@" in text else ""
+        profile, profile_error = await giant_target(target)
+        if profile_error: return f"❌ {profile_error}"
+        ok, detail = await giant_moderate("ban", rid, str(profile["id"]), reason="أمر b@ عبر البوت")
+        if not ok: return f"❌ تعذر الحظر: {detail}"
+        bans = load_bans()
+        room_bans = bans.setdefault(str(rid), [])
+        if str(profile["id"]) not in room_bans:
+            room_bans.append(str(profile["id"]))
+            save_bans(bans)
+        return message("moderation.ban", "🚫 تم حظر @{name}.", name=profile.get("username") or target)
+
+    if lower_text.startswith(("ub@", "unban@")):
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        target = text.split("@", 1)[1].strip() if "@" in text else ""
+        profile, profile_error = await giant_target(target)
+        if profile_error: return f"❌ {profile_error}"
+        ok, detail = await giant_moderate("unban", rid, str(profile["id"]))
+        if not ok: return f"❌ تعذر فك الحظر: {detail}"
+        bans = load_bans()
+        room_bans = bans.setdefault(str(rid), [])
+        if str(profile["id"]) in room_bans:
+            room_bans.remove(str(profile["id"]))
+            save_bans(bans)
+        return f"✅ تم فك حظر @{profile.get('username') or target}."
 
     if cmd in ("طرد", "kick"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
