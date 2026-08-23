@@ -88,7 +88,7 @@ POINTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "points.j
 GIFT_POINTS_LOCK = asyncio.Lock()
 REPLIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "replies.json")
 MASTERS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "masters.json")
-BANS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bans.json")
+MUTES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mutes.json")
 MESSAGES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "messages.json")
 ROOMS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rooms.json")
 MODERATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moderation.json")
@@ -448,7 +448,7 @@ def load_replies(): return load_json(REPLIES_PATH, {})
 def save_replies(r): save_json(REPLIES_PATH, r)
 def load_masters(): return load_json(MASTERS_PATH, [])
 def save_masters(m): save_json(MASTERS_PATH, m)
-def load_bans(): return load_json(BANS_PATH, {})
+def load_mutes(): return load_json(MUTES_PATH, {})
 
 def load_messages():
     return load_json(MESSAGES_PATH, {})
@@ -466,7 +466,7 @@ def message(key, default="", **kwargs):
         return template.format(**kwargs)
     except Exception:
         return template
-def save_bans(b): save_json(BANS_PATH, b)
+def save_mutes(m): save_json(MUTES_PATH, m)
 def load_rooms_saved(): return load_json(ROOMS_PATH, {})
 def save_rooms_saved(r): save_json(ROOMS_PATH, r)
 def load_moderation(): return load_json(MODERATION_PATH, {"enabled": {}, "words": []})
@@ -582,11 +582,6 @@ async def enforce_forbidden_word(rid, uid, username, matched_word):
     if not ok:
         log.error("forbidden-word moderation rejected rid=%s uid=%s: %s", rid, uid, detail)
         return False, detail
-    bans = load_bans()
-    room_bans = bans.setdefault(str(rid), [])
-    if str(uid) not in room_bans:
-        room_bans.append(str(uid))
-        save_bans(bans)
     return True, None
 
 async def all_room_ids():
@@ -630,9 +625,88 @@ async def game_cooldown(uid, username):
     seconds = int(C.get("game_cooldown_seconds", 30))
     return check_cooldown(uid, username, "game", seconds)
 
-async def is_banned(rid, uid):
-    bans = load_bans()
-    return uid in bans.get(rid, [])
+async def muted_minutes_remaining(rid, uid):
+    """إرجاع دقائق الكتم المتبقية وتنظيف الكتم المنتهي تلقائيًا."""
+    mutes = load_mutes()
+    room_mutes = mutes.get(str(rid), {})
+    item = room_mutes.get(str(uid)) if isinstance(room_mutes, dict) else None
+    if not isinstance(item, dict):
+        return 0
+    try:
+        until = float(item.get("until", 0))
+    except (TypeError, ValueError):
+        until = 0
+    remaining = until - time.time()
+    if remaining <= 0:
+        room_mutes.pop(str(uid), None)
+        if room_mutes:
+            mutes[str(rid)] = room_mutes
+        else:
+            mutes.pop(str(rid), None)
+        save_mutes(mutes)
+        return 0
+    return max(1, int((remaining + 59) // 60))
+
+async def set_temporary_mute(rid, uid, username, minutes, muted_by):
+    mutes = load_mutes()
+    room_mutes = mutes.setdefault(str(rid), {})
+    room_mutes[str(uid)] = {
+        "username": str(username or ""),
+        "muted_by": str(muted_by or ""),
+        "until": time.time() + (int(minutes) * 60),
+        "created_at": now_iso(),
+    }
+    save_mutes(mutes)
+
+async def clear_temporary_mute(rid, uid):
+    mutes = load_mutes()
+    room_mutes = mutes.get(str(rid), {})
+    if not isinstance(room_mutes, dict) or str(uid) not in room_mutes:
+        return False
+    room_mutes.pop(str(uid), None)
+    if room_mutes:
+        mutes[str(rid)] = room_mutes
+    else:
+        mutes.pop(str(rid), None)
+    save_mutes(mutes)
+    return True
+
+async def list_active_mutes():
+    """إرجاع المكتومين الحاليين عبر كل الغرف، مع حذف الحالات المنتهية."""
+    mutes = load_mutes()
+    active = []
+    changed = False
+    now = time.time()
+    for room_id, room_mutes in list(mutes.items()):
+        if not isinstance(room_mutes, dict):
+            mutes.pop(room_id, None)
+            changed = True
+            continue
+        for muted_id, item in list(room_mutes.items()):
+            if not isinstance(item, dict):
+                room_mutes.pop(muted_id, None)
+                changed = True
+                continue
+            try:
+                remaining = float(item.get("until", 0)) - now
+            except (TypeError, ValueError):
+                remaining = 0
+            if remaining <= 0:
+                room_mutes.pop(muted_id, None)
+                changed = True
+                continue
+            active.append({
+                "room_id": room_id,
+                "username": str(item.get("username") or muted_id),
+                "minutes": max(1, int((remaining + 59) // 60)),
+                "muted_by": str(item.get("muted_by") or ""),
+            })
+        if not room_mutes:
+            mutes.pop(room_id, None)
+            changed = True
+    if changed:
+        save_mutes(mutes)
+    return active
 
 async def is_master(uid, username):
     if username.lower() == OWNER: return True
@@ -754,16 +828,13 @@ async def giant_moderation_preflight(room_id, target_id=None):
 
 async def giant_moderate(action, room_id, target_id, reason="", new_rank=""):
     """Execute the documented Giant RPC and return success only when RPC succeeds."""
-    # العضو المحظور قد لا يبقى في room_members، لذلك لا نطلب عضويته عند فك الحظر.
-    allowed, detail = await giant_moderation_preflight(room_id, None if action == "unban" else target_id)
+    allowed, detail = await giant_moderation_preflight(room_id, target_id)
     if not allowed:
         return False, detail
     if action == "kick":
         _, err = await rpc("kick_room_member", {"_room": room_id, "_user": target_id})
     elif action == "ban":
         _, err = await rpc("ban_room_member", {"_room": room_id, "_user": target_id, "_reason": str(reason or "إجراء إداري عبر البوت")[:240]})
-    elif action == "unban":
-        _, err = await rpc("unban_room_member", {"_room": room_id, "_user": target_id})
     elif action == "rank":
         if new_rank not in {"member", "moderator", "admin"}:
             return False, "الرتبة غير صالحة. استخدم: عضو، مشرف، أو ادمن."
@@ -834,11 +905,6 @@ async def giant_consume_interactive(room_id, user_id, username, text):
     if action == "kick":
         return message("moderation.kick", "👞 تم طرد @{name}.", name=profile.get("username") or normalized)
     if action == "ban":
-        bans = load_bans()
-        room_bans = bans.setdefault(str(room_id), [])
-        if str(profile["id"]) not in room_bans:
-            room_bans.append(str(profile["id"]))
-            save_bans(bans)
         return message("moderation.ban", "🚫 تم حظر @{name}.", name=profile.get("username") or normalized)
     return f"✅ تم تعيين @{profile.get('username') or normalized} برتبة {label}."
 
@@ -1240,7 +1306,7 @@ async def telegram_backup():
     tmp = Path(tempfile.mkdtemp(prefix="bot_backup_"))
     archive = tmp / f"bot_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.zip"
     try:
-        include = ["rooms.json", "masters.json", "bans.json", "moderation.json", "welcome.json",
+        include = ["rooms.json", "masters.json", "mutes.json", "moderation.json", "welcome.json",
                    "replies.json", "points.json", "vip_users.json", "custom_games.json", "published_posts.json", "social_events.json"]
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
             # config بدون كلمات مرور/مفاتيح. الأسرار لا تدخل النسخة الاحتياطية.
@@ -2429,7 +2495,10 @@ async def send_game_card(rid, game_key, title, lines, fallback_text=None):
 # ============================================================================
 
 async def handle_room(rid, text, uid, media_url=None, message_type=None):
-    if await is_banned(rid, uid): return None
+    muted_for = await muted_minutes_remaining(rid, uid)
+    if muted_for:
+        log.info("رسالة متجاهلة من مستخدم مكتوم room=%s user=%s remaining=%sm", rid, uid, muted_for)
+        return None
     p_name = await username_of(uid)
     lower_text = text.strip().lower()
 
@@ -2437,9 +2506,9 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if social_reply is not None:
         return social_reply
 
-    admin_prefixes = ("+mf@", "-mf@", "clear@mf", "l@mf", "mf@on", "mf@off",
+    admin_prefixes = ("+mf@", "-mf@", "clear@mf", "l@mf", "mf@on", "mf@off", "mf@status", "m@", "mute@", "um@", "unmute@", "mutes", "المكتومين", "قائمة الكتم",
                       "+wc ", "clear@wc", "l@wc", "wc@on", "wc@off", "mas@")
-    if not lower_text.startswith(admin_prefixes + ("b@", "ban@", "ub@", "unban@", "mf@status", "mf status")):
+    if not lower_text.startswith(admin_prefixes):
         interactive = giant_interactive_action(lower_text)
         if interactive:
             if not await is_master(uid, p_name):
@@ -2502,8 +2571,18 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         vip_error = await require_vip(uid, p_name, "نظام النشر")
         if vip_error: return vip_error
         url = text.split(maxsplit=1)[1].strip()
-        await broadcast_media("📢", url, m_type="image")
-        return "✅ تم نشر الصورة في كل الغرف."
+        source_room = rooms.get(rid, "الغرفة")
+        post_id = str(uuid.uuid4())
+        posts = load_published_posts()
+        posts[post_id] = {"post_id": post_id, "owner_id": str(uid), "owner_name": p_name, "source_room_id": str(rid), "media_url": url, "type": "image", "title": "منشور صورة", "created_at": now_iso()}
+        save_published_posts(posts)
+        codes = await register_social_codes(post_id, uid, p_name, "image", "منشور صورة", rid)
+        published = 0
+        for target_rid in await all_room_ids():
+            caption = message("publish.broadcast", "🖼️ IMAGE BROADCAST\n.sa Publish image\n👤 {publisher}\n📝 {description}\n\n⏱️ Source: {source_label}\n🆔 {code}\n💬 Room: {room}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg", publisher=p_name, description="منشور صورة", source_label=source_room, code=codes["like"], room=source_room, like=codes["like"], love=codes["love"], dislike=codes["dislike"], comment=codes["comment"], report=codes["report"])
+            await room_send_media(target_rid, caption, url, m_type="image")
+            published += 1
+        return f"✅ تم نشر الصورة في {published} غرفة ببطاقة تفاعلية."
 
     # نشر@: الماستر يطلب صورة في رسالة لاحقة، ثم ينشرها في كل الغرف.
     publish_key = (rid, uid)
@@ -2573,8 +2652,8 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             for target_rid in await all_room_ids():
                 try:
                     caption = message("publish.broadcast",
-                        "🖼️ IMAGE BROADCAST\n👤 {publisher}\n📝 {description}\n💬 Room: {room}\n👍 lk@{like}",
-                        publisher=p_name, description=description or "منشور صورة", room=source_room,
+                        "🖼️ IMAGE BROADCAST\n.sa Publish image\n👤 {publisher}\n📝 {description}\n\n⏱️ Source: {source_label}\n🆔 {code}\n💬 Room: {room}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
+                        publisher=p_name, description=description or "منشور صورة", source_label=source_room, code=codes["like"], room=source_room,
                         like=codes["like"], love=codes["love"], dislike=codes["dislike"],
                         comment=codes["comment"], report=codes["report"])
                     await room_send_media(target_rid, caption, public_media_url, m_type="image")
@@ -2645,16 +2724,11 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if lower_text in ("mf@on", "mf on"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
         mod = load_moderation(); mod.setdefault("enabled", {})[str(rid)] = True; save_moderation(mod)
-        return "✅ تم تفعيل فلتر الألفاظ والحظر الفعلي في هذه الغرفة."
+        return "✅ تم تفعيل فلتر الألفاظ في هذه الغرفة."
     if lower_text in ("mf@off", "mf off"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
         mod = load_moderation(); mod.setdefault("enabled", {})[str(rid)] = False; save_moderation(mod)
         return "⛔ تم تعطيل فلتر الألفاظ في هذه الغرفة."
-    if lower_text in ("mf@status", "mf status"):
-        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
-        mod = load_moderation()
-        active = mod.get("enabled", {}).get(str(rid), False)
-        return f"🛡️ فلتر الكلمات: {'مفعّل' if active else 'متوقف'}\n🚫 الكلمات المسجلة: {len(mod.get('words', []))}"
     if lower_text == "clear@mf":
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
         mod = load_moderation(); mod["words"] = []; save_moderation(mod)
@@ -2669,10 +2743,8 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if not word: return "❌ الصيغة: +mf@كلمة"
         mod = load_moderation(); words = mod.setdefault("words", [])
         if word not in words: words.append(word)
-        mod.setdefault("enabled", {})[str(rid)] = True
         save_moderation(mod)
-        return f"✅ تمت إضافة الكلمة وتفعيل فلتر الحظر لهذه الغرفة: {word}"
-
+        return f"✅ تمت إضافة الكلمة الممنوعة: {word}"
     if lower_text.startswith("-mf@"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
         word = text.split("@", 1)[1].strip()
@@ -2765,12 +2837,14 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         await music_queue.put((rid, arg, "YouTube", uid, p_name))
         return f"🎵 @{p_name} جاري تنفيذ طلبك…\n🔎 البحث عن: {arg}\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
-    if cmd in ("مشاركة", "share"):
+    if cmd in ("مشاركة", "مشاركه", "share"):
         vip_error = await require_vip(uid, p_name, "مشاركة الأغاني")
         if vip_error: return vip_error
         current = music_state.get(rid)
         if not current:
             return "❌ لا توجد أغنية حالياً للمشاركة."
+        if arg:
+            return await share_music_to_user(uid, arg, current)
         return f"🎵 مشاركة الأغنية\n🎶 {current.get('title','المقطع')} — {current.get('artist','')}\n🔗 {current.get('spotify_url') or current.get('youtube_url') or ''}"
 
     if cmd in (".تشغيل", "spotify", "سبوتيفاي"):
@@ -3001,33 +3075,41 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             return f"❌ حالة إدارة البوت: {rank_error}"
         return f"🤖 رتبة البوت في الغرفة: {rank}\n👤 لديك صلاحية ماستر للبوت: {'نعم' if master else 'لا'}"
 
-    if lower_text.startswith(("b@", "ban@")):
+    if lower_text.startswith(("m@", "mute@")):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
-        target = text.split("@", 1)[1].strip() if "@" in text else ""
+        raw = text.split("@", 1)[1].strip() if "@" in text else ""
+        parts = raw.rsplit(maxsplit=1)
+        if len(parts) != 2 or not parts[1].isdigit():
+            return "❌ الصيغة: m@اسم_المستخدم 10 — المدة بالدقائق."
+        target, minutes_text = parts
+        minutes = int(minutes_text)
+        if not 1 <= minutes <= 10080:
+            return "❌ مدة الكتم يجب أن تكون من 1 إلى 10080 دقيقة."
         profile, profile_error = await giant_target(target)
         if profile_error: return f"❌ {profile_error}"
-        ok, detail = await giant_moderate("ban", rid, str(profile["id"]), reason="أمر b@ عبر البوت")
-        if not ok: return f"❌ تعذر الحظر: {detail}"
-        bans = load_bans()
-        room_bans = bans.setdefault(str(rid), [])
-        if str(profile["id"]) not in room_bans:
-            room_bans.append(str(profile["id"]))
-            save_bans(bans)
-        return message("moderation.ban", "🚫 تم حظر @{name}.", name=profile.get("username") or target)
+        if str(profile["id"]) == str(BOT_ID): return "❌ لا يمكن كتم البوت نفسه."
+        await set_temporary_mute(rid, str(profile["id"]), profile.get("username") or target, minutes, p_name)
+        return f"🔇 تم كتم @{profile.get('username') or target} لمدة {minutes} دقيقة داخل البوت."
 
-    if lower_text.startswith(("ub@", "unban@")):
+    if lower_text.startswith(("um@", "unmute@")):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
         target = text.split("@", 1)[1].strip() if "@" in text else ""
         profile, profile_error = await giant_target(target)
         if profile_error: return f"❌ {profile_error}"
-        ok, detail = await giant_moderate("unban", rid, str(profile["id"]))
-        if not ok: return f"❌ تعذر فك الحظر: {detail}"
-        bans = load_bans()
-        room_bans = bans.setdefault(str(rid), [])
-        if str(profile["id"]) in room_bans:
-            room_bans.remove(str(profile["id"]))
-            save_bans(bans)
-        return f"✅ تم فك حظر @{profile.get('username') or target}."
+        removed = await clear_temporary_mute(rid, str(profile["id"]))
+        return (f"🔊 تم إلغاء كتم @{profile.get('username') or target}." if removed else f"⚠️ @{profile.get('username') or target} غير مكتوم.")
+
+    if lower_text in ("mutes", "المكتومين", "قائمة الكتم"):
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        muted_users = await list_active_mutes()
+        if not muted_users:
+            return "🔊 لا يوجد مستخدمون مكتومون حاليًا."
+        lines = ["🔇 المكتومون حاليًا:"]
+        for item in muted_users:
+            room_name = rooms.get(item["room_id"], item["room_id"])
+            by = f" | بواسطة @{item['muted_by']}" if item.get("muted_by") else ""
+            lines.append(f"• @{item['username']} — {item['minutes']} دقيقة متبقية | غرفة: {room_name}{by}")
+        return "\n".join(lines)
 
     if cmd in ("طرد", "kick"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
@@ -3043,11 +3125,6 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if profile_error: return f"❌ {profile_error}"
         ok, detail = await giant_moderate("ban", rid, str(profile["id"]), reason="إجراء ماستر عبر البوت")
         if not ok: return f"❌ تعذر الحظر: {detail}"
-        bans = load_bans()
-        room_bans = bans.setdefault(str(rid), [])
-        if str(profile["id"]) not in room_bans:
-            room_bans.append(str(profile["id"]))
-            save_bans(bans)
         return message("moderation.ban", "🚫 تم حظر @{name}.", name=profile.get("username") or arg)
 
     if cmd in ("ترقية", "ترقي", "رفع", "promote", "تنزيل", "demote"):
@@ -3875,7 +3952,7 @@ def self_repair_sync():
     results=[]
     for path, default in [
         (CONFIG_PATH, dict(C)), (POINTS_PATH, {}), (REPLIES_PATH, {}), (MASTERS_PATH, []),
-        (BANS_PATH, {}), (ROOMS_PATH, {}), (MODERATION_PATH, {"enabled":{},"words":[]}),
+        (MUTES_PATH, {}), (ROOMS_PATH, {}), (MODERATION_PATH, {"enabled":{},"words":[]}),
         (WELCOME_PATH, {}), (PUBLISHED_POSTS_PATH, {}), (SOCIAL_EVENTS_PATH, {}),
         (VIP_USERS_PATH, {}), (CUSTOM_GAMES_PATH, {}), (CUSTOM_COMMANDS_PATH, {}),
         (TESTING_GAMES_PATH, {}), (TESTING_STATE_PATH, {}),
