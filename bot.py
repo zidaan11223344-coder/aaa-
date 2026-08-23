@@ -53,10 +53,10 @@ except Exception:
     Llama = None
     LOCAL_LLAMACPP_AVAILABLE = False
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, features as PILFeatures
     PIL_AVAILABLE = True
 except ImportError:
-    Image = ImageDraw = ImageFont = None
+    Image = ImageDraw = ImageFont = PILFeatures = None
     PIL_AVAILABLE = False
 try:
     import arabic_reshaper
@@ -957,12 +957,62 @@ DEFAULT_GIFT_FONT = str(Path(__file__).resolve().parent / "assets" / "Amiri-Bold
 FONT_PATH = str(C.get("gift_font", DEFAULT_GIFT_FONT))
 if not Path(FONT_PATH).exists():
     FONT_PATH = DEFAULT_GIFT_FONT
+ARABIC_CARD_FONT = str(BASE_DIR / "assets" / "NotoSansArabic-SemiBold.ttf")
+
+def native_arabic_layout_available():
+    try:
+        return bool(PIL_AVAILABLE and PILFeatures and PILFeatures.check_feature("raqm"))
+    except Exception:
+        return False
+
+NATIVE_ARABIC_LAYOUT = native_arabic_layout_available()
+
+def load_arabic_card_font(size):
+    """خط موحّد لبطاقات النتائج؛ لا نستخدم خط Pillow الافتراضي لأنه لا يدعم العربية."""
+    for fp in (ARABIC_CARD_FONT, FONT_PATH, "/usr/share/fonts/truetype/noto/NotoSansArabic-SemiBold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+        try:
+            if Path(fp).is_file():
+                kwargs = {}
+                if NATIVE_ARABIC_LAYOUT and hasattr(ImageFont, "Layout"):
+                    kwargs["layout_engine"] = ImageFont.Layout.RAQM
+                return ImageFont.truetype(fp, size, **kwargs)
+        except Exception:
+            continue
+    return None
+
+def load_username_card_font(size):
+    """خط لاتيني منفصل لاسم المستخدم كي لا يتحول إلى مربعات في الخط العربي."""
+    for fp in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", ARABIC_CARD_FONT):
+        try:
+            if Path(fp).is_file():
+                return ImageFont.truetype(fp, size)
+        except Exception:
+            continue
+    return None
+
+def card_rtl_text(value):
+    text = str(value)
+    return text if NATIVE_ARABIC_LAYOUT else shape_text(text)
+
+def card_rtl_options(text):
+    if NATIVE_ARABIC_LAYOUT and any("\u0600" <= ch <= "\u06ff" for ch in str(text)):
+        return {"direction": "rtl", "language": "ar"}
+    return {}
 
 def shape_text(value):
     text = str(value)
     if arabic_reshaper and get_display and any("\u0600" <= ch <= "\u06ff" for ch in text):
         return get_display(arabic_reshaper.reshape(text))
     return text
+
+def card_text_font(text, start_size, max_width, min_size=24):
+    """اختيار حجم الخط العربي بحسب عرض البطاقة، بعد تطبيق تشكيل واتجاه RTL."""
+    rendered = card_rtl_text(text)
+    for size in range(start_size, min_size - 1, -2):
+        font = load_arabic_card_font(size)
+        if font and font.getbbox(rendered, **card_rtl_options(text))[2] <= max_width:
+            return font
+    return load_arabic_card_font(min_size)
 
 def fit_font(text, max_width, start_size=32, min_size=16):
     if not PIL_AVAILABLE:
@@ -975,6 +1025,35 @@ def fit_font(text, max_width, start_size=32, min_size=16):
         size -= 2
     return ImageFont.truetype(FONT_PATH, min_size)
 
+def clean_gift_display_name(value, limit=28):
+    """اسم مرئي مختصر للصورة؛ يحتفظ بالنص الأصلي كاملاً في رسالة الهدية القابلة للنسخ."""
+    import unicodedata
+    raw = unicodedata.normalize("NFKC", str(value or "").strip().lstrip("@"))
+    cleaned = []
+    for ch in raw:
+        category = unicodedata.category(ch)
+        # إزالة المطّ والزخارف والرموز غير المدعومة التي تكسر تشكيل العربية داخل الصورة.
+        if ch == "ـ" or category in ("Mn", "Me", "Cf", "So", "Sk", "Mc"):
+            continue
+        # نسمح بالحروف العربية القياسية فقط؛ بعض الامتدادات الزخرفية لا توجد في خط البطاقة وتظهر كمربعات.
+        is_standard_arabic = ("\u0621" <= ch <= "\u063a") or ("\u0641" <= ch <= "\u064a") or ("\u0660" <= ch <= "\u0669")
+        is_latin_or_digit = ("a" <= ch.lower() <= "z") or ("0" <= ch <= "9")
+        if is_standard_arabic or is_latin_or_digit or ch in "_.-":
+            cleaned.append(ch)
+    result = "".join(cleaned).strip("._-")
+    return result[:limit] or "مستخدم"
+
+def gift_name_font(text, max_width, start_size=32, min_size=18):
+    """اختيار خط واضح وتصغير الاسم تلقائياً حتى لا يخرج من المستطيل."""
+    is_arabic = any("\u0600" <= ch <= "\u06ff" for ch in str(text))
+    rendered = card_rtl_text(text)
+    options = card_rtl_options(text)
+    for size in range(start_size, min_size - 1, -2):
+        font = load_arabic_card_font(size) if is_arabic else load_username_card_font(size)
+        if font and font.getbbox(rendered, **options)[2] <= max_width:
+            return font
+    return load_arabic_card_font(min_size) if is_arabic else load_username_card_font(min_size)
+
 def render_gift_image(gift, sender_name, receiver_name):
     if not PIL_AVAILABLE:
         raise RuntimeError("Pillow غير مثبتة؛ لن تظهر أسماء FROM وTO داخل الصورة")
@@ -984,21 +1063,27 @@ def render_gift_image(gift, sender_name, receiver_name):
     image = Image.open(template).convert("RGBA")
     draw = ImageDraw.Draw(image)
     width, height = image.size
-    # خانتا FROM وTO في الجزء السفلي من القالب؛ يمكن تخصيصهما من config.json.
-    from_y = int(float(C.get("gift_from_y", height * 0.78)))
-    to_y = int(float(C.get("gift_to_y", height * 0.88)))
-    box_left = int(float(C.get("gift_box_left", width * 0.12)))
-    box_right = int(float(C.get("gift_box_right", width * 0.88)))
+    # نستخدم مركز كل مستطيل بدل الحافة العلوية، حتى يرتفع الاسم ولا يخرج من الإطار.
+    from_y = int(float(C.get("gift_from_center_y", C.get("gift_from_y", height * 0.775))))
+    to_y = int(float(C.get("gift_to_center_y", C.get("gift_to_y", height * 0.885))))
+    box_left = int(float(C.get("gift_box_left", width * 0.20)))
+    box_right = int(float(C.get("gift_box_right", width * 0.80)))
     max_width = max(100, box_right - box_left - 24)
     line_color = tuple(C.get("gift_text_color", [255, 255, 255]))
     shadow = (0, 0, 0, 180)
-    for label, name, y in (("FROM:", sender_name, from_y), ("TO:", receiver_name, to_y)):
-        text = shape_text(f"{label} @{name}")
-        font = fit_font(text, max_width)
-        bbox = draw.textbbox((0, 0), text, font=font, stroke_width=1)
+    for name, y in ((sender_name, from_y), (receiver_name, to_y)):
+        # داخل القالب نعرض الاسم فقط ليبقى واضحاً، وتبقى تسمية المرسل/المستلم والنص الأصلي في الرسالة أسفل الصورة.
+        text = clean_gift_display_name(name)
+        shown = card_rtl_text(text)
+        options = card_rtl_options(text)
+        font = gift_name_font(text, max_width)
+        if not font:
+            return None
+        bbox = draw.textbbox((0, 0), shown, font=font, stroke_width=1, **options)
         x = (width - (bbox[2] - bbox[0])) // 2
-        draw.text((x + 2, y + 2), text, font=font, fill=shadow, stroke_width=2, stroke_fill=shadow)
-        draw.text((x, y), text, font=font, fill=line_color, stroke_width=1, stroke_fill=(20, 20, 20, 220))
+        top = int(y - (bbox[3] - bbox[1]) / 2 - bbox[1])
+        draw.text((x + 2, top + 2), shown, font=font, fill=shadow, stroke_width=2, stroke_fill=shadow, **options)
+        draw.text((x, top), shown, font=font, fill=line_color, stroke_width=1, stroke_fill=(20, 20, 20, 220), **options)
     path = GIFT_RENDER_DIR / f"gift_{gift['display_id']}_{uuid.uuid4().hex}.png"
     image.save(path, "PNG", optimize=True)
     return path
@@ -3472,7 +3557,8 @@ def render_custom_game_result_sync(game, username, won):
     if not PIL_AVAILABLE:
         return None
     title = str(game.get("title") or game.get("command") or "لعبة")[:80]
-    result = "🎉 تم الفوز!" if won else "😔 حظاً سعيداً"
+    is_million = str(game.get("command") or "") == "مليون"
+    result = "تم الحصول على مليون!" if is_million and won else ("تم الفوز!" if won else "حظاً سعيداً")
     try:
         bg = (18, 25, 38) if won else (35, 38, 48)
         local_asset = BASE_DIR / str(game.get("local_asset") or "")
@@ -3485,27 +3571,33 @@ def render_custom_game_result_sync(game, username, won):
             img = Image.new("RGB", (1000, 620), bg)
         draw = ImageDraw.Draw(img)
         draw.rounded_rectangle((28, 365, 972, 592), radius=28, fill=(4, 27, 31), outline=(54, 178, 132), width=3)
-        font_big = None; font_mid = None
-        for fp in (str(BASE_DIR / "assets" / "Amiri-Bold.ttf"), "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
-            try:
-                if Path(fp).is_file():
-                    font_big = ImageFont.truetype(fp, 58)
-                    font_mid = ImageFont.truetype(fp, 38)
-                    break
-            except Exception:
-                pass
-        font_big = font_big or ImageFont.load_default()
-        font_mid = font_mid or font_big
+        # إن لم تُثبت مكتبتا تشكيل العربية، نرجع النص فقط بدلاً من بطاقة بحروف غير متصلة.
+        if not (arabic_reshaper and get_display):
+            log.warning("Arabic card rendering requires arabic-reshaper and python-bidi")
+            return None
+        title_line = "لعبة مليون" if is_million else title
+        winner_label = "الفائز" if won else "اللاعب"
+        username_line = "@" + str(username).lstrip("@")
+        font_big = card_text_font(title_line, 54, 850, 34)
+        font_mid = card_text_font(result, 42, 850, 28)
+        font_label = card_text_font(winner_label, 34, 850, 26)
+        font_name = load_username_card_font(32)
+        font_brand = load_arabic_card_font(28)
+        if not all((font_big, font_mid, font_label, font_name, font_brand)):
+            log.warning("Arabic card font is unavailable")
+            return None
         def centered(text, y, font):
-            shaped = shape_text(text)
-            box = draw.textbbox((0,0), shaped, font=font)
+            shaped = card_rtl_text(text)
+            options = card_rtl_options(text)
+            box = draw.textbbox((0,0), shaped, font=font, **options)
             x = (1000 - (box[2]-box[0])) // 2
-            draw.text((x+3,y+3), shaped, font=font, fill=(0,0,0))
-            draw.text((x,y), shaped, font=font, fill=(255,255,255))
-        centered(title, 65, font_big)
+            draw.text((x+2,y+2), shaped, font=font, fill=(0,0,0), **options)
+            draw.text((x,y), shaped, font=font, fill=(255,255,255), **options)
+        centered(title_line, 62, font_big)
         centered(result, 405, font_mid)
-        centered("الفائز: @" + str(username) if won else "اللاعب: @" + str(username), 475, font_mid)
-        centered("Giant Chat", 545, font_mid)
+        centered(winner_label, 462, font_label)
+        draw.text((500, 510), username_line, font=font_name, fill=(255,255,255), anchor="ma")
+        draw.text((500, 546), "Giant Chat", font=font_brand, fill=(207, 233, 225), anchor="ma")
         outdir = BASE_DIR / "generated_games"
         outdir.mkdir(exist_ok=True)
         path = outdir / f"result_{_command_key(title).replace(' ','_')}_{uuid.uuid4().hex}.jpg"
