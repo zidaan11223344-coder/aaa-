@@ -1131,19 +1131,12 @@ async def send_gift_command(rid, sender_uid, sender_name, raw_text):
     # أرسل الصورة الديناميكية فقط عندما تنجح، حتى لا تظهر خانات FROM وTO فارغة.
     if image_url:
         await room_send_media(rid, f"{gift['emoji']} {gift['name']}", image_url, m_type="image")
-    await room_send(rid, f"🎁 أرسل @{sender_name} إلى @{receiver_name} هدية {gift['name']} {gift['emoji']}")
-    card = (
-        f"{gift['emoji']} 🎁 {gift['name']}\n"
-        f"👤 المرسل: @{sender_name}\n"
-        f"🎯 المستقبل: @{receiver_name}\n"
-        f"💰 القيمة: {gift['cost_points']} نقطة\n"
-        f"💳 رصيدك المتبقي: {remaining_points} نقطة"
-    )
+    card = message("gifts.room_card", "{emoji} 🎁 {gift_name}\n📤 المرسل: @{sender}\n📥 المستلم: @{receiver}\n💰 القيمة: {cost} نقطة\n💳 رصيد المرسل المتبقي: {balance} نقطة", emoji=gift["emoji"], gift_name=gift["name"], sender=sender_name, receiver=receiver_name, cost=gift["cost_points"], balance=remaining_points)
     await room_send(rid, card)
     # إشعارات خاصة للطرفين: لا تبقى معلومات الهدية داخل الغرفة فقط.
     try:
-        await dm_send(receiver_rows[0]["id"], f"🎁 @{sender_name} أرسل لك {gift['emoji']} {gift['name']} بقيمة {gift['cost_points']} نقطة.")
-        await dm_send(sender_uid, f"✅ تم إرسال {gift['emoji']} {gift['name']} إلى @{receiver_name} بقيمة {gift['cost_points']} نقطة.")
+        await dm_send(receiver_rows[0]["id"], message("gifts.private_receiver", "🎁 @{sender} أرسل لك {emoji} {gift_name} بقيمة {cost} نقطة.", sender=sender_name, emoji=gift["emoji"], gift_name=gift["name"], cost=gift["cost_points"]))
+        await dm_send(sender_uid, message("gifts.private_sender", "✅ تم إرسال {emoji} {gift_name} إلى @{receiver} بقيمة {cost} نقطة.", emoji=gift["emoji"], gift_name=gift["name"], receiver=receiver_name, cost=gift["cost_points"]))
     except Exception:
         log.exception("gift private notification failed")
     # الهدية تُنفّذ مرة واحدة في الغرفة الأصلية، ثم يُنشر إعلانها وصورتها في كل غرف البوت الأخرى.
@@ -1180,9 +1173,10 @@ async def dm_send(uid, text):
         "v": 1, "id": str(uuid.uuid4()), "content": text, "message_type": "text",
         "media_url": None, "media_duration_ms": None, "reply_to_id": None, "created_at": now_iso()
     }
-    await run(lambda: sb.table("dm_relay").insert({
+    _, error = await run(lambda: sb.table("dm_relay").insert({
         "sender_id": BOT_ID, "recipient_id": uid, "envelope": envelope
     }).execute())
+    return not bool(error)
 
 async def dm_send_media(uid, text, media_url, m_type="image"):
     envelope = {
@@ -1192,6 +1186,76 @@ async def dm_send_media(uid, text, media_url, m_type="image"):
     await run(lambda: sb.table("dm_relay").insert({
         "sender_id": BOT_ID, "recipient_id": uid, "envelope": envelope
     }).execute())
+
+
+async def send_room_invitation(rid, inviter_uid, inviter_name, target_name):
+    """إرسال دعوة نصية فقط؛ لا تغيّر عضوية الغرفة ولا تتطلب صلاحية ماستر."""
+    target, target_error = await giant_target(target_name)
+    if target_error:
+        return message("invitations.user_not_found", "❌ الحساب @{username} غير موجود.", username=str(target_name or "").lstrip("@").strip())
+    if str(target.get("id")) == str(inviter_uid):
+        return message("invitations.self", "⚠️ لا يمكنك إرسال دعوة إلى نفسك.")
+    room_name = rooms.get(rid, message("social.defaults.room", "الغرفة"))
+    private_text = message(
+        "invitations.private",
+        "{sender} يدعوك لغرفة {room}.",
+        sender=inviter_name,
+        room=room_name,
+    )
+    if not await dm_send(target["id"], private_text):
+        return message("invitations.delivery_failed", "❌ تعذر إرسال الدعوة إلى @{username} في الخاص.", username=target.get("username") or target_name)
+    return message("invitations.sent", "✅ أرسلت دعوة @{username} إلى غرفة {room} في الخاص.", username=target.get("username") or target_name, room=room_name)
+
+
+async def send_private_group_message(rid, sender_uid, sender_name, body):
+    """إرسال رسالة الماستر الخاصة لأعضاء الغرفة الحالية فقط، مع حد آمن قابل للتعديل."""
+    content = str(body or "").strip()
+    if not content:
+        return message("private_messaging.group_syntax", "❌ الصيغة: جماعية@الرسالة")
+    if len(content) > 1600:
+        return message("private_messaging.too_long", "❌ الرسالة طويلة جدًا؛ الحد الأقصى 1600 حرف.")
+    member_rows, member_error = await table_select(
+        lambda: sb.table("room_members").select("user_id").eq("room_id", rid).execute()
+    )
+    if member_error:
+        return message("private_messaging.members_error", "❌ تعذر قراءة أعضاء الغرفة لإرسال الرسالة الخاصة.")
+    recipients = []
+    excluded = {str(sender_uid), str(BOT_ID)}
+    for row in member_rows or []:
+        recipient_id = str(row.get("user_id") or "")
+        if recipient_id and recipient_id not in excluded and recipient_id not in recipients:
+            recipients.append(recipient_id)
+    if not recipients:
+        return message("private_messaging.no_recipients", "ℹ️ لا يوجد أعضاء آخرون في هذه الغرفة لإرسال الرسالة لهم.")
+    try:
+        limit = max(1, int(C.get("private_group_limit", 500)))
+    except (TypeError, ValueError):
+        limit = 500
+    limited = recipients[:limit]
+    room_name = rooms.get(rid, message("social.defaults.room", "الغرفة"))
+    private_text = message(
+        "private_messaging.group_private",
+        "📣 رسالة من @{sender} في غرفة {room}\n\n{body}",
+        sender=sender_name,
+        room=room_name,
+        body=content,
+    )
+    sent = failed = 0
+    for recipient_id in limited:
+        if await dm_send(recipient_id, private_text):
+            sent += 1
+        else:
+            failed += 1
+            log.warning("group DM failed room=%s recipient=%s sender=%s", rid, recipient_id, sender_name)
+        await asyncio.sleep(0.04)
+    return message(
+        "private_messaging.group_success",
+        "✅ أُرسلت الرسالة الخاصة إلى {sent} عضوًا من غرفة {room}. تعذر الإرسال إلى {failed}. {limited}",
+        sent=sent,
+        failed=failed,
+        room=room_name,
+        limited=("تم تطبيق حد الإرسال لهذه الدفعة." if len(recipients) > len(limited) else ""),
+    )
 
 
 def _code4():
@@ -1233,18 +1297,24 @@ async def handle_social_reaction(rid, text, uid, p_name):
                 found = key; post = item; post_id = pid; break
         if found: break
     if not post:
-        return "❌ كود التفاعل غير صالح أو انتهت صلاحيته."
+        return message("social.errors.invalid_code", "❌ كود التفاعل غير صالح أو انتهت صلاحيته.")
 
     owner_id = str(post.get("owner_id") or "")
     if not owner_id:
-        return "❌ تعذر تحديد صاحب المنشور."
+        return message("social.errors.missing_owner", "❌ تعذر تحديد صاحب المنشور.")
     if owner_id == str(uid):
-        return "⚠️ لا يمكنك تسجيل تفاعل على منشورك بنفس حسابك."
+        return message("social.errors.own_reaction", "⚠️ لا يمكنك تسجيل تفاعل على منشورك بنفس حسابك.")
 
-    labels = {"like":"👍 إعجاب", "love":"❤️ أحببتة", "dislike":"👎 عدم إعجاب", "comment":"💬 تعليق", "report":"🚨 إبلاغ"}
     if action in ("cm", "report") and not extra:
-        return f"❌ اكتب: {action}@{code} النص"
+        return message("social.errors.missing_text", "❌ اكتب: {action}@{code} النص", action=action, code=code)
     action_key = {"lk":"like", "lv":"love", "dl":"dislike", "cm":"comment", "report":"report"}[action]
+    labels = {
+        "like": message("social.labels.like", "👍 إعجاب"),
+        "love": message("social.labels.love", "❤️ أحببتة"),
+        "dislike": message("social.labels.dislike", "👎 عدم إعجاب"),
+        "comment": message("social.labels.comment", "💬 تعليق"),
+        "report": message("social.labels.report", "🚨 إبلاغ"),
+    }
     event = {
         "id": str(uuid.uuid4()), "post_id": str(post_id), "type": action_key,
         "actor_id": str(uid), "actor_name": p_name, "owner_id": owner_id,
@@ -1254,22 +1324,19 @@ async def handle_social_reaction(rid, text, uid, p_name):
     events[event["id"]] = event
     save_social_events(events)
 
-    title = post.get("title") or ("منشور صورة" if post.get("type") == "image" else "أغنية")
-    room_name = rooms.get(rid, "الغرفة")
+    title = post.get("title") or (message("social.defaults.image_title", "منشور صورة") if post.get("type") == "image" else message("social.defaults.music_title", "أغنية"))
+    room_name = rooms.get(rid, message("social.defaults.room", "الغرفة"))
     if action_key == "comment":
-        notification = (f"💬 تعليق جديد على منشورك\n🎵/🖼️ {title}\n"
-                        f"👤 من: @{p_name}\n🏠 الغرفة: {room_name}\n📝 {extra}")
+        notification = message("social.notifications.comment", "💬 تعليق جديد على منشورك\n🎵/🖼️ {title}\n👤 من: @{actor}\n🏠 الغرفة: {room}\n📝 {text}", title=title, actor=p_name, room=room_name, text=extra)
     elif action_key == "report":
-        notification = (f"🚨 بلاغ على منشورك\n🎵/🖼️ {title}\n"
-                        f"👤 من: @{p_name}\n🏠 الغرفة: {room_name}\n📝 السبب: {extra}")
+        notification = message("social.notifications.report", "🚨 بلاغ على منشورك\n🎵/🖼️ {title}\n👤 من: @{actor}\n🏠 الغرفة: {room}\n📝 السبب: {text}", title=title, actor=p_name, room=room_name, text=extra)
     else:
-        notification = (f"{labels[action_key]} على منشورك\n"
-                        f"🎵/🖼️ {title}\n👤 من: @{p_name}\n🏠 الغرفة: {room_name}")
+        notification = message("social.notifications.reaction", "{label} على منشورك\n🎵/🖼️ {title}\n👤 من: @{actor}\n🏠 الغرفة: {room}", label=labels[action_key], title=title, actor=p_name, room=room_name)
     try:
         await dm_send(owner_id, notification)
     except Exception:
         log.exception("social private notification failed")
-    return f"✅ تم تسجيل {labels[action_key]} وإرسال الإشعار إلى خاص الناشر."
+    return message("social.saved", "✅ تم تسجيل {label} وإرسال الإشعار إلى خاص الناشر.", label=labels[action_key])
 
 async def telegram_find_chat_id():
     """Find the latest private Telegram chat that interacted with this bot.
@@ -1343,19 +1410,20 @@ async def telegram_backup():
 async def share_music_to_user(sender_uid, target_name, current):
     target = str(target_name or "").strip().lstrip("@")
     if not target or not current:
-        return "❌ الصيغة: مشاركة@اسم_الشخص"
+        return message("sharing.syntax", "❌ الصيغة: مشاركة اسم_الشخص")
     rows, _ = await table_select(lambda: sb.table("profiles").select("id,username").ilike("username", target).limit(1).execute())
     if not rows:
-        return f"❌ الحساب @{target} غير موجود."
+        return message("sharing.user_not_found", "❌ الحساب @{username} غير موجود.", username=target)
     receiver = rows[0]
     title = current.get("title", "المقطع")
     artist = current.get("artist", "")
     media = current.get("audio_url") or current.get("youtube_url") or current.get("tiktok_url")
     if not media:
-        return "❌ لا يوجد ملف صوتي أو رابط صالح للمشاركة."
-    await dm_send(receiver["id"], f"🎵 تمت مشاركة أغنية معك من @{await username_of(sender_uid)}\n🎶 {title} — {artist}")
-    await dm_send_media(receiver["id"], f"▶️ {title}", media, "voice")
-    return f"✅ تمت مشاركة «{title}» مع @{receiver.get('username') or target} في الخاص."
+        return message("sharing.missing_media", "❌ لا يوجد ملف صوتي أو رابط صالح للمشاركة.")
+    sender = await username_of(sender_uid)
+    await dm_send(receiver["id"], message("sharing.private_intro", "🎵 تمت مشاركة أغنية معك من @{sender}\n🎶 {title} — {artist}", sender=sender, title=title, artist=artist))
+    await dm_send_media(receiver["id"], message("sharing.private_audio_caption", "▶️ {title}", title=title), media, "voice")
+    return message("sharing.success", "✅ تمت مشاركة «{title}» مع @{username} في الخاص.", title=title, username=receiver.get("username") or target)
 
 async def user_presence(uid, username):
     rows, _ = await table_select(lambda: sb.table("room_members").select("room_id").eq("user_id", uid).execute())
@@ -1365,8 +1433,8 @@ async def user_presence(uid, username):
         rooms_rows, _ = await table_select(lambda: sb.table("rooms").select("id,name").in_("id", room_ids).execute())
         names = [r.get("name") or str(r.get("id")) for r in rooms_rows or []]
     if names:
-        return f"🟢 @{username} متصل حالياً\n🏠 الغرف: " + ", ".join(names)
-    return f"⚪ @{username} غير ظاهر حالياً في أي غرفة متصلة بالبوت."
+        return message("presence.online", "🟢 @{username} متصل حالياً\n🏠 الغرف: {rooms}", username=username, rooms=", ".join(names))
+    return message("presence.offline", "⚪ @{username} غير ظاهر حالياً في أي غرفة متصلة بالبوت.", username=username)
 
 async def _master_user_ids():
     """Resolve saved master usernames/IDs to profile IDs for private diagnostics."""
@@ -2254,46 +2322,32 @@ async def play_track(rid, track, source_label, requester_id, requester_name):
     if not media_url:
         direct_url = track.get("youtube_url") or track.get("spotify_url") or track.get("tiktok_url")
         if direct_url:
-            await room_send(rid, f"🎵 @{requester_name} — جاري تشغيل: {title}\n🏠 الغرفة: {source_room}\n▶️ {direct_url}")
+            await room_send(rid, message("music.direct_link", "🎵 @{requester_name} — جاري تشغيل: {title}\n🏠 الغرفة: {room}\n▶️ {url}", requester_name=requester_name, title=title, room=source_room, url=direct_url))
             return True, None
         return False, "تم الوصول للنتيجة لكن لم يتم إنشاء ملف صوتي ولا رابط تشغيل مباشر."
 
-    # تسجيل الأغنية كمنشور بدون إنشاء صورة للأغنية، حتى تبقى التفاعلات
-    # (إعجاب/حب/تعليق) مرتبطة بصاحب الطلب عبر post_id.
-    post_id = str(uuid.uuid4())
-    posts = load_published_posts()
-    posts[post_id] = {
-        "post_id": post_id, "owner_id": str(requester_id), "owner_name": requester_name,
-        "source_room_id": str(rid), "type": "music", "title": title,
-        "media_url": media_url, "audio_url": media_url, "created_at": now_iso()
-    }
-    save_published_posts(posts)
-    codes = await register_social_codes(post_id, requester_id, requester_name, "music", title, rid)
-
-    # الرسالة محفوظة خارج bot.py في messages.json لتسهيل تعديلها.
-    caption = message("music.broadcast",
-        "🎵 SONG BROADCAST\n🎤 {requester_name}\n{title}\n💬 Room: {room}\n👍 lk@{code}",
-        requester_name=requester_name, title=title, source_label=source_label,
-        code=codes["like"], room=source_room)
-    targets = await all_room_ids()
-    for target_rid in targets:
-        try:
-            await room_send(target_rid, caption)
-            duration_ms = int(track.get("duration_ms") or (float(track.get("duration") or 0) * 1000))
-            if duration_ms <= 0:
-                raise RuntimeError("مدة الصوت صفر؛ تم منع إرسال بصمة صوت فارغة")
-            await room_send_media(
-                target_rid,
-                f"▶️ تشغيل | {title}",
-                media_url, m_type="voice", duration_ms=duration_ms,
-            )
-        except Exception as exc:
-            log.exception("music broadcast failed room=%s", target_rid)
-            await report_music_error_to_masters(
-                target_rid, source_label, title,
-                f"{type(exc).__name__}: {exc}",
-                stage="إرسال تفاصيل/رسالة الصوت إلى الغرف"
-            )
+    # التشغيل يبقى في الغرفة التي طلبت الأغنية فقط، بلا أكواد أو تفاعلات اجتماعية.
+    try:
+        duration_ms = int(track.get("duration_ms") or (float(track.get("duration") or 0) * 1000))
+        if duration_ms <= 0:
+            raise RuntimeError("مدة الصوت صفر؛ تم منع إرسال بصمة صوت فارغة")
+        caption = message(
+            "music.local_caption",
+            "🎵 {title}\n🎤 {artist}\n👤 الطلب بواسطة: @{requester_name}\n🏠 الغرفة: {room}",
+            title=title,
+            artist=artist,
+            requester_name=requester_name,
+            room=source_room,
+        )
+        await room_send_media(rid, caption, media_url, m_type="voice", duration_ms=duration_ms)
+    except Exception as exc:
+        log.exception("music local send failed room=%s", rid)
+        await report_music_error_to_masters(
+            rid, source_label, title,
+            f"{type(exc).__name__}: {exc}",
+            stage="إرسال الصوت إلى الغرفة الأصلية"
+        )
+        return False, str(exc)
     return True, None
 
 def friendly_music_error(error):
@@ -2410,7 +2464,7 @@ async def get_help_page(uid, p_name, advance=False):
 
 
 
-async def _draw_game_text(draw, xy, text, font, fill=(30,30,30), anchor="ma"):
+def _draw_game_text(draw, xy, text, font, fill=(30,30,30), anchor="ma"):
     """رسم عربي بشكل صحيح عندما تتوفر arabic_reshaper/python-bidi."""
     text = str(text)
     if arabic_reshaper and get_display:
@@ -2427,11 +2481,7 @@ async def _draw_game_text(draw, xy, text, font, fill=(30,30,30), anchor="ma"):
 # ============================================================================
 
 def render_game_card_sync(game_key, title, lines):
-    """إنشاء صورة اللعبة فقط.
-
-    تفاصيل النتيجة لا تُرسم داخل الصورة؛ تُرسل كنص مستقل بعد الصورة حتى تبقى
-    صور الألعاب كما هي في مجلد assets، وبنفس الأسلوب الذي طلبه المستخدم.
-    """
+    """إنشاء بطاقة لعبة أنيقة، مع إبقاء النص نفسه بعد الصورة قابلاً للنسخ."""
     if not PIL_AVAILABLE:
         return None
 
@@ -2439,8 +2489,14 @@ def render_game_card_sync(game_key, title, lines):
         "slap": "assets/slap_action.jpg", "war": "assets/war_game.png",
         "fight": "assets/fight_action.jpg", "boxing": "assets/defense_action.jpg"
     }
+    luxe_map = {
+        "war": "assets/game_war_luxe.png", "mine": "assets/game_mine_luxe.png",
+        "dice": "assets/game_dice_luxe.png", "volcano": "assets/game_volcano_luxe.png",
+        "race": "assets/game_race_luxe.png"
+    }
     generated = BASE_DIR / "assets" / f"game_{game_key}.jpg"
-    src = BASE_DIR / local_map.get(game_key, f"assets/game_{game_key}.jpg")
+    luxe_src = BASE_DIR / luxe_map.get(game_key, "")
+    src = luxe_src if luxe_src.is_file() else BASE_DIR / local_map.get(game_key, f"assets/game_{game_key}.jpg")
     if generated.is_file() and game_key not in local_map:
         src = generated
 
@@ -2452,9 +2508,19 @@ def render_game_card_sync(game_key, title, lines):
     except Exception:
         im = Image.new("RGB", (900, 560), (240, 243, 247))
 
-    im.thumbnail((900, 700), Image.LANCZOS)
-    canvas = Image.new("RGB", (900, im.height), (245, 247, 250))
-    canvas.paste(im, ((900 - im.width) // 2, 0))
+    im.thumbnail((860, 760), Image.LANCZOS)
+    canvas = Image.new("RGB", (900, 1120), (5, 27, 31))
+    canvas.paste(im, ((900 - im.width) // 2, 22))
+    draw = ImageDraw.Draw(canvas)
+    draw.rounded_rectangle((28, 790, 872, 1092), radius=34, fill=(11, 49, 52), outline=(60, 184, 139), width=3)
+    try:
+        font_title = ImageFont.truetype(FONT_PATH, 44)
+        font_line = ImageFont.truetype(FONT_PATH, 31)
+    except Exception:
+        font_title = ImageFont.load_default(); font_line = font_title
+    _draw_game_text(draw, (450, 838), title, font_title, fill=(241, 210, 117), anchor="ma")
+    for index, line in enumerate(lines[:4]):
+        _draw_game_text(draw, (450, 895 + index * 46), line, font_line, fill=(242, 250, 247), anchor="ma")
 
     outdir = BASE_DIR / "generated_games"
     outdir.mkdir(exist_ok=True)
@@ -2507,7 +2573,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         return social_reply
 
     admin_prefixes = ("+mf@", "-mf@", "clear@mf", "l@mf", "mf@on", "mf@off", "mf@status", "m@", "mute@", "um@", "unmute@", "mutes", "المكتومين", "قائمة الكتم",
-                      "+wc ", "clear@wc", "l@wc", "wc@on", "wc@off", "mas@")
+                      "+wc ", "clear@wc", "l@wc", "wc@on", "wc@off", "mas@", "جماعيه@", "جماعية@", "group@")
     if not lower_text.startswith(admin_prefixes):
         interactive = giant_interactive_action(lower_text)
         if interactive:
@@ -2566,7 +2632,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if vip_error: return vip_error
         msg = text.split(maxsplit=1)[1].strip()
         await broadcast_text("📢 " + msg)
-        return "✅ تم نشر الرسالة في كل الغرف."
+        return message("publish.direct_text_sent", "✅ تم نشر الرسالة في كل الغرف.")
     if text.startswith("نشرصورة ") or text.startswith("broadcast_image "):
         vip_error = await require_vip(uid, p_name, "نظام النشر")
         if vip_error: return vip_error
@@ -2579,10 +2645,11 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         codes = await register_social_codes(post_id, uid, p_name, "image", "منشور صورة", rid)
         published = 0
         for target_rid in await all_room_ids():
-            caption = message("publish.broadcast", "🖼️ IMAGE BROADCAST\n.sa Publish image\n👤 {publisher}\n📝 {description}\n\n⏱️ Source: {source_label}\n🆔 {code}\n💬 Room: {room}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg", publisher=p_name, description="منشور صورة", source_label=source_room, code=codes["like"], room=source_room, like=codes["like"], love=codes["love"], dislike=codes["dislike"], comment=codes["comment"], report=codes["report"])
+            caption = message("publish.broadcast", "", publisher=p_name, description="منشور صورة", source_label=source_room, code=codes["like"], room=source_room, like=codes["like"], love=codes["love"], dislike=codes["dislike"], comment=codes["comment"], report=codes["report"])
             await room_send_media(target_rid, caption, url, m_type="image")
             published += 1
-        return f"✅ تم نشر الصورة في {published} غرفة ببطاقة تفاعلية."
+        log.info("image publish completed rooms=%s sender=%s", published, p_name)
+        return None
 
     # نشر@: الماستر يطلب صورة في رسالة لاحقة، ثم ينشرها في كل الغرف.
     publish_key = (rid, uid)
@@ -2593,7 +2660,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if "@" in text:
             description = text.split("@", 1)[1].strip()
         publish_pending[publish_key] = {"created_at": time.time(), "description": description}
-        return "🖼️ أرسل الصورة الآن خلال دقيقتين، وسيتم نشرها في كل الغرف مع الوصف الذي كتبته."
+        return message("publish.pending_prompt", "🖼️ أرسل الصورة الآن خلال دقيقتين، وسيتم نشرها في كل الغرف مع الوصف الذي كتبته.")
 
     async def cache_publish_media(source_url):
         """Copy an incoming image to this bot's public storage so it remains
@@ -2651,19 +2718,18 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             published = 0
             for target_rid in await all_room_ids():
                 try:
-                    caption = message("publish.broadcast",
-                        "🖼️ IMAGE BROADCAST\n.sa Publish image\n👤 {publisher}\n📝 {description}\n\n⏱️ Source: {source_label}\n🆔 {code}\n💬 Room: {room}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
+                    caption = message("publish.broadcast", "",
                         publisher=p_name, description=description or "منشور صورة", source_label=source_room, code=codes["like"], room=source_room,
                         like=codes["like"], love=codes["love"], dislike=codes["dislike"],
                         comment=codes["comment"], report=codes["report"])
                     await room_send_media(target_rid, caption, public_media_url, m_type="image")
-                    await room_send(target_rid, message("publish.reaction_hint", "❤️ إعجاب | 👎 عدم إعجاب | ↩️ رد على الصورة"))
                     published += 1
                 except Exception:
                     log.exception("publish@ failed for room %s", target_rid)
-            return f"✅ تم نشر الصورة في {published} غرفة."
+            log.info("pending image publish completed rooms=%s sender=%s", published, p_name)
+            return None
         elif media_url:
-            return "⚠️ الملف المرسل ليس صورة. أرسل صورة بعد أمر نشر@."
+            return message("publish.non_image", "⚠️ الملف المرسل ليس صورة. أرسل صورة بعد أمر نشر@.")
 
     if text == "المسترات":
         masters = load_masters()
@@ -2711,6 +2777,12 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             masters.append(target); save_masters(masters)
             return f"✅ تم إضافة @{target} كـ ماستر."
         return f"⚠️ @{target} ماستر بالفعل."
+
+    if lower_text.startswith(("جماعيه@", "جماعية@", "group@")):
+        if not await is_master(uid, p_name):
+            return message("private_messaging.master_only", "🚫 الرسالة الجماعية في الخاص للماستر فقط.")
+        body = text.split("@", 1)[1].strip() if "@" in text else ""
+        return await send_private_group_message(rid, uid, p_name, body)
 
     if text.startswith("+r@"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
@@ -2792,10 +2864,13 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     GAME_COMMANDS = {"عمل","job","كف","slap","مضاربة","bet","حرب","war","سرقة","rob","قتال","fight",
                      "سباق","race","رشوة","سلة","قصف","اضرب","ورق","سدد","ملاكمة","بركان","شبح","حظ","نرد","تعدين","زواج","marriage"}
 
-    async def require_game_cooldown(game_command):
-        ok_cd, rem_cd = check_cooldown(uid, p_name, f"game:{game_command}", int(C.get("game_cooldown_seconds", 30)))
+    async def require_game_cooldown(game_command, cooldown_seconds=None):
+        interval = int(cooldown_seconds if cooldown_seconds is not None else C.get("game_cooldown_seconds", 30))
+        ok_cd, rem_cd = check_cooldown(uid, p_name, f"game:{game_command}", interval)
         if not ok_cd:
-            return f"⏳ @{p_name} انتظر {rem_cd} ثانية قبل إعادة لعبة «{game_command}». الفاصل 30 ثانية لهذه اللعبة فقط."
+            if str(game_command) == "مليون":
+                return message("games.million_cooldown", "⏳ @{name} انتظر {remaining} ثانية قبل المحاولة التالية في لعبة مليون. المهلة بين المحاولات دقيقتان.", name=p_name, remaining=rem_cd)
+            return f"⏳ @{p_name} انتظر {rem_cd} ثانية قبل إعادة لعبة «{game_command}». الفاصل {interval} ثانية لهذه اللعبة فقط."
         return None
 
     async def require_music_cooldown():
@@ -2822,6 +2897,17 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             return f"❌ الحساب @{target} غير موجود."
         return await user_presence(rows[0]["id"], rows[0].get("username") or target)
 
+    if lower_text.startswith(("دعوة@", "دعوه@", "invite@")):
+        target = text.split("@", 1)[1].strip() if "@" in text else ""
+        if not target:
+            return message("invitations.syntax", "❌ الصيغة: دعوة اسم_المستخدم")
+        return await send_room_invitation(rid, uid, p_name, target)
+
+    if cmd in ("دعوة", "دعوه", "invite"):
+        if not arg:
+            return message("invitations.syntax", "❌ الصيغة: دعوة اسم_المستخدم")
+        return await send_room_invitation(rid, uid, p_name, arg)
+
     if text.strip().lower().startswith("مشاركة@"):
         vip_error = await require_vip(uid, p_name, "مشاركة الأغاني")
         if vip_error: return vip_error
@@ -2842,10 +2928,10 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if vip_error: return vip_error
         current = music_state.get(rid)
         if not current:
-            return "❌ لا توجد أغنية حالياً للمشاركة."
+            return message("sharing.no_current_music", "❌ لا توجد أغنية حالياً للمشاركة.")
         if arg:
             return await share_music_to_user(uid, arg, current)
-        return f"🎵 مشاركة الأغنية\n🎶 {current.get('title','المقطع')} — {current.get('artist','')}\n🔗 {current.get('spotify_url') or current.get('youtube_url') or ''}"
+        return message("sharing.current_music_card", "🎵 مشاركة الأغنية\n🎶 {title} — {artist}\n🔗 {url}", title=current.get("title", "المقطع"), artist=current.get("artist", ""), url=current.get("spotify_url") or current.get("youtube_url") or "")
 
     if cmd in (".تشغيل", "spotify", "سبوتيفاي"):
         vip_error = await require_vip(uid, p_name, "تشغيل الأغاني")
@@ -3183,13 +3269,14 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     active_tests = load_active_tests()
     testing_games = load_testing_games()
     if cmd in active_tests and cmd in testing_games:
-        if not await is_master(uid, p_name):
-            return "🔐 لعبة الاختبار متاحة للمالك/الماستر فقط."
         custom = testing_games[cmd]
-        cd_error = await require_game_cooldown(cmd)
+        if not bool(custom.get("open_test", False)) and not await is_master(uid, p_name):
+            return "🔐 لعبة الاختبار متاحة للمالك/الماستر فقط."
+        cd_error = await require_game_cooldown(cmd, custom.get("cooldown_seconds"))
         if cd_error:
             return cd_error
-        await room_send(rid, f"🔎 جاري البحث عن {custom.get('title', cmd)}...")
+        search_text = message("games.million_search", custom.get("search_message") or "🔎 جاري البحث عن مليون...") if cmd == "مليون" else (custom.get("search_message") or f"🔎 جاري البحث عن {custom.get('title', cmd)}...")
+        await room_send(rid, search_text)
         await asyncio.sleep(0.5)
         try:
             win_chance = max(1, min(100, int(custom.get("win_chance", 50))))
@@ -3201,8 +3288,13 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         except Exception:
             delta = 20 if win else -5
         add_points(uid, p_name, delta)
-        await send_custom_game_result(rid, custom, p_name, win)
+        if cmd != "مليون" or win:
+            await send_custom_game_result(rid, custom, p_name, win)
         msg = custom.get("win_message") if win else custom.get("lose_message")
+        if custom.get("command") == "مليون" and win:
+            return message("games.million_result", "🧪 لعبة مليون — وضع اختبار\n{result}\n🏆 الفائز: @{winner}\n💰 الجائزة: {points} نقطة", result=msg or ("🎉 فوز!" if win else "😔 حظًا سعيدًا"), winner=p_name, points=delta)
+        if custom.get("command") == "مليون":
+            return msg or message("games.million_lose", "😔 حظًا سعيدًا، جرب في المرة القادمة.")
         return f"🧪 اختبار: {msg or ('🎉 فوز!' if win else '😅 خسارة!')} @{p_name}\n💰 {'+' if delta >= 0 else ''}{delta} نقطة"
 
     custom_games = load_custom_games()
@@ -3383,8 +3475,16 @@ def render_custom_game_result_sync(game, username, won):
     result = "🎉 تم الفوز!" if won else "😔 حظاً سعيداً"
     try:
         bg = (18, 25, 38) if won else (35, 38, 48)
-        img = Image.new("RGB", (1000, 620), bg)
+        local_asset = BASE_DIR / str(game.get("local_asset") or "")
+        if local_asset.is_file():
+            art = Image.open(local_asset).convert("RGB")
+            art.thumbnail((1000, 620), Image.LANCZOS)
+            img = Image.new("RGB", (1000, 620), bg)
+            img.paste(art, ((1000 - art.width) // 2, 0))
+        else:
+            img = Image.new("RGB", (1000, 620), bg)
         draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle((28, 365, 972, 592), radius=28, fill=(4, 27, 31), outline=(54, 178, 132), width=3)
         font_big = None; font_mid = None
         for fp in (str(BASE_DIR / "assets" / "Amiri-Bold.ttf"), "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
             try:
@@ -3402,10 +3502,10 @@ def render_custom_game_result_sync(game, username, won):
             x = (1000 - (box[2]-box[0])) // 2
             draw.text((x+3,y+3), shaped, font=font, fill=(0,0,0))
             draw.text((x,y), shaped, font=font, fill=(255,255,255))
-        centered(title, 100, font_big)
-        centered(result, 245, font_mid)
-        centered("الفائز: @" + str(username) if won else "اللاعب: @" + str(username), 340, font_mid)
-        centered("Giant Chat", 500, font_mid)
+        centered(title, 65, font_big)
+        centered(result, 405, font_mid)
+        centered("الفائز: @" + str(username) if won else "اللاعب: @" + str(username), 475, font_mid)
+        centered("Giant Chat", 545, font_mid)
         outdir = BASE_DIR / "generated_games"
         outdir.mkdir(exist_ok=True)
         path = outdir / f"result_{_command_key(title).replace(' ','_')}_{uuid.uuid4().hex}.jpg"
@@ -3421,10 +3521,11 @@ async def send_custom_game_result(rid, game, username, won):
         try:
             url = await _store_media(path, "game", "image/jpeg")
             await room_send_media(rid, "", url, m_type="image")
-            await broadcast_media(
-                f"🎮 {game.get('title', game.get('command','لعبة'))} — {'🎉 فاز' if won else '😔 لم يفز'} @{username}",
-                url, m_type="image", exclude_rid=rid
-            )
+            if won and bool(game.get("broadcast_on_win", False)):
+                await broadcast_media(
+                    f"🎮 {game.get('title', game.get('command','لعبة'))} — 🎉 الفائز: @{username}",
+                    url, m_type="image", exclude_rid=rid
+                )
         except Exception:
             log.exception("failed to publish custom game result image")
         finally:
