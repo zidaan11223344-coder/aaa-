@@ -1,3 +1,18 @@
+# ============================================================================
+# دليل التعديل اليدوي للبوت
+#
+# الأقسام المهمة مرتبة بعلامات BEGIN / END داخل هذا الملف:
+# 1) فلتر الكلمات
+# 2) الهدايا والتفاعلات الخاصة
+# 3) الأغاني
+# 4) النشر
+# 5) صور الألعاب ونتائجها
+# 6) كل لعبة بعلامة واضحة داخل handle_room
+# 7) الألعاب المخصصة + إعداد لعبة مليون
+#
+# لا تغيّر أسماء الدوال أو المتغيرات العامة إلا إذا كنت تعرف أثرها.
+# ============================================================================
+
 # -*- coding: utf-8 -*-
 """
 alsfer_bot — بوت Giant Chat المطور
@@ -73,7 +88,7 @@ POINTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "points.j
 GIFT_POINTS_LOCK = asyncio.Lock()
 REPLIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "replies.json")
 MASTERS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "masters.json")
-BANS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bans.json")
+MESSAGES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "messages.json")
 ROOMS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rooms.json")
 MODERATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moderation.json")
 WELCOME_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "welcome.json")
@@ -432,8 +447,23 @@ def load_replies(): return load_json(REPLIES_PATH, {})
 def save_replies(r): save_json(REPLIES_PATH, r)
 def load_masters(): return load_json(MASTERS_PATH, [])
 def save_masters(m): save_json(MASTERS_PATH, m)
-def load_bans(): return load_json(BANS_PATH, {})
-def save_bans(b): save_json(BANS_PATH, b)
+
+def load_messages():
+    return load_json(MESSAGES_PATH, {})
+
+def message(key, default="", **kwargs):
+    """قراءة رسالة من messages.json مع دعم {placeholders}."""
+    data = load_messages()
+    cur = data
+    for part in str(key).split("."):
+        if not isinstance(cur, dict):
+            cur = None; break
+        cur = cur.get(part)
+    template = cur if isinstance(cur, str) else default
+    try:
+        return template.format(**kwargs)
+    except Exception:
+        return template
 def load_rooms_saved(): return load_json(ROOMS_PATH, {})
 def save_rooms_saved(r): save_json(ROOMS_PATH, r)
 def load_moderation(): return load_json(MODERATION_PATH, {"enabled": {}, "words": []})
@@ -517,6 +547,11 @@ def normalize_text(s):
     value = re.sub(r"\s+", " ", value)
     return value
 
+
+# ============================================================================
+# [قسم فلتر الكلمات المحظورة] BEGIN
+# ============================================================================
+
 async def check_forbidden_word(rid, text):
     """إرجاع الكلمة المحظورة المطابقة، أو None إذا لم توجد مطابقة."""
     mod = load_moderation()
@@ -534,27 +569,29 @@ async def check_forbidden_word(rid, text):
             return str(word)
     return None
 
-async def enforce_forbidden_word(rid, uid, username, matched_word):
-    """حظر المستخدم محلياً وطرده فعلياً من الغرفة عبر RPC."""
-    bans = load_bans()
-    room_key = str(rid)
-    room_bans = bans.setdefault(room_key, [])
-    uid = str(uid)
-    if uid not in room_bans:
-        room_bans.append(uid)
-        save_bans(bans)
 
-    # room_leave هو نفس مسار الطرد المستخدم في أمر حظر/طرد الماستر.
+# [فلتر الكلمات] تنفيذ الحظر والطرد — بداية الدالة
+
+async def enforce_forbidden_word(rid, uid, username, matched_word):
+    """حظر فعلي في الغرفة عبر RPC الرسمي؛ لا يوجد تخزين للحظر داخل البوت."""
     last_error = None
     for attempt in range(3):
-        _, err = await rpc("room_leave", {"_room": rid, "_user": uid})
+        _, err = await rpc("ban_room_member", {
+            "_room": rid,
+            "_user": str(uid),
+            "_reason": f"الكلمة المحظورة: {matched_word}",
+        })
         if not err:
             return True, None
         last_error = err
         await asyncio.sleep(0.35 * (attempt + 1))
 
-    log.error("forbidden-word room_leave failed rid=%s uid=%s: %s", rid, uid, last_error)
+    log.error(
+        "forbidden-word ban_room_member failed rid=%s uid=%s: %s",
+        rid, uid, last_error
+    )
     return False, last_error
+
 
 async def all_room_ids():
     """Return every room visible to the bot, not only rooms currently cached."""
@@ -598,8 +635,19 @@ async def game_cooldown(uid, username):
     return check_cooldown(uid, username, "game", seconds)
 
 async def is_banned(rid, uid):
-    bans = load_bans()
-    return uid in bans.get(rid, [])
+    """فحص الحظر من قائمة الغرفة الحقيقية في التطبيق، وليس من ملف البوت."""
+    rows, err = await table_select(
+        lambda: sb.table("room_bans")
+        .select("user_id")
+        .eq("room_id", rid)
+        .eq("user_id", uid)
+        .limit(1)
+        .execute()
+    )
+    if err:
+        log.warning("room_bans check failed rid=%s uid=%s: %s", rid, uid, err)
+        return False
+    return bool(rows)
 
 async def is_master(uid, username):
     if username.lower() == OWNER: return True
@@ -804,6 +852,11 @@ def gift_view(gift):
     }
 
 
+
+# ============================================================================
+# [قسم الهدايا] BEGIN
+# ============================================================================
+
 async def gift_catalog_message():
     gifts = [gift_view(g) for g in await get_gifts_catalog()]
     if not gifts:
@@ -892,6 +945,11 @@ async def send_gift_command(rid, sender_uid, sender_name, raw_text):
     await broadcast_text(card, exclude_rid=rid)
     return None
 
+
+
+# ============================================================================
+# [قسم الإرسال + التفاعلات الخاصة] BEGIN
+# ============================================================================
 
 async def room_send(rid, text):
     await run(lambda: sb.table("room_messages").insert({
@@ -1069,6 +1127,11 @@ async def telegram_backup():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+
+# ============================================================================
+# [قسم الأغاني والمشاركة] BEGIN
+# ============================================================================
+
 async def share_music_to_user(sender_uid, target_name, current):
     target = str(target_name or "").strip().lstrip("@")
     if not target or not current:
@@ -1154,6 +1217,9 @@ async def report_music_error_to_masters(rid, source, query, error, stage="تشغ
             log.exception("failed to send music diagnostic to master %s", master_id)
 
 # ----------------------------- الموسيقى -----------------------------
+
+# [الأغاني] استخراج YouTube — بداية
+
 async def _yt_extract(search_query):
     """البحث عن فيديو YouTube بدون محاولة تنزيله.
     نبدأ بـ yt-dlp ببحث flat حتى لا نفشل بسبب حظر استخراج صيغ الفيديو،
@@ -1962,6 +2028,9 @@ async def render_music_card(track, requester_name, source_room):
     canvas.save(path, quality=92, optimize=True)
     return path
 
+
+# [الأغاني] تشغيل المسار — بداية
+
 async def play_track(rid, track, source_label, requester_id, requester_name):
     if not track:
         return False, "لم أجد المقطع المطلوب"
@@ -1993,22 +2062,11 @@ async def play_track(rid, track, source_label, requester_id, requester_name):
     save_published_posts(posts)
     codes = await register_social_codes(post_id, requester_id, requester_name, "music", title, rid)
 
-    # نفس شكل بطاقة SONG BROADCAST في الصورة المرسلة، مع كود واحد متغير لكل أغنية.
-    caption = (
-        "🎵 SONG BROADCAST\n"
-        ".sa Music name\n"
-        f"🎤 {requester_name}\n"
-        f"{title}\n\n"
-        f"⏱️ Source: {source_label}\n"
-        f"🆔 {codes['like']}\n"
-        f"💬 Room: {source_room}\n"
-        "━━━━━━━━━━━━━\n"
-        f"👍 lk@{codes['like']}\n"
-        f"❤️ lv@{codes['like']}\n"
-        f"👎 dl@{codes['like']}\n"
-        f"💬 cm@{codes['like']} msg\n"
-        f"🚨 report@{codes['like']} msg"
-    )
+    # الرسالة محفوظة خارج bot.py في messages.json لتسهيل تعديلها.
+    caption = message("music.broadcast",
+        "🎵 SONG BROADCAST\n🎤 {requester_name}\n{title}\n💬 Room: {room}\n👍 lk@{code}",
+        requester_name=requester_name, title=title, source_label=source_label,
+        code=codes["like"], room=source_room)
     targets = await all_room_ids()
     for target_rid in targets:
         try:
@@ -2123,94 +2181,24 @@ async def stop(rid):
     return True, "⏹️ تم إيقاف الأغنية بواسطة البوت"
 
 # ----------------------------- أوامر الغرفة -----------------------------
-HELP_GAMES = """━━━━━━━━ 🎮 أوامر الألعاب ━━━━━━━━
-⚔️ حرب — يبدأ/ينضم للعبة الحرب، ثم اكتب رقماً من 1 إلى 6
-🖐️ كف — تحدي كف
-🥊 قتال — قتال سريع
-🏁 سباق — سباق
-💰 رشوة — رشوة
-🏀 سلة — كرة سلة
-💣 قصف — قصف
-🐸 اضرب — اضرب الضفدع
-🃏 ورق — ورق
-⚽ سدد — تسديد
-🥊 ملاكمة — ملاكمة
-💼 عمل — وظيفة
-🌋 بركان — بركان
-👻 شبح — صيد الشبح
-🎲 مضاربة رقم — مراهنة
-🎲 حظ / نرد / تعدين / زواج
-━━━━━━━━━━━━━━━━━━━━
-كل لعبة ترسل الصورة ثم تفاصيلها كنص فقط.
-🔐 التوثيق قابل للتشغيل/الإيقاف من المالك. عند التفعيل: vip@اسم_المستخدم.
-"""
+HELP_PAGE_STATE = {}
 
-HELP_ROOM = """━━━━━━━━ 🤖 جميع أوامر البوت ━━━━━━━━
-[1] الحساب والنقاط
-points / نقاطي — عرض نقاطك
-توب — أفضل 10 لاعبين
-dp@الاسم — صورة المستخدم
-p@الاسم — البروفايل
-st@الاسم — حالة المستخدم
+def get_help_pages():
+    pages = load_messages().get("help_pages", [])
+    return pages if isinstance(pages, list) and pages else ["لا توجد قوائم مساعدة."]
 
-[2] الموسيقى
-🔒 تشغيل/مشاركة الأغاني تحتاج توثيق VIP من صاحب البوت.
-تشغيل اسم الأغنية — YouTube
-تيك اسم الأغنية — TikTok
-.تشغيل اسم الأغنية — Spotify (يبحث عن النسخة الصوتية)
-مشاركة — مشاركة الأغنية الحالية
-تخطي — تخطي الأغنية
-ايقاف — إيقاف الصوت
+def get_game_title(game_key, fallback):
+    return load_messages().get("games", {}).get("titles", {}).get(game_key, fallback)
 
-[3] الألعاب
-العاب — عرض أوامر الألعاب
-""" + HELP_GAMES + """
-
-[4] الرتب والإدارة
-o@الاسم — مالك
-m@الاسم — عضوية
-n@الاسم — إزالة رتبة
-a@الاسم — إشراف
-mas@الاسم — ماستر
-umas@الاسم — إزالة ماستر
-المسترات — قائمة الماسترات
-k@الاسم — طرد
-b@الاسم — حظر
-ip@الاسم — حظر IP
-
-[5] الهدايا
-🔐 توثيق VIP: vip@اسم_المستخدم (صاحب البوت فقط)
-gv — عرض الهدايا
-gv@رقم_الهدية@اسم_الحساب — إرسال هدية
-
-[6] الترحيب والردود
-+wc رسالة — إضافة ترحيب
-+wc رسالة %id% — ترحيب مع الاسم
-clear@wc — حذف الترحيبات
-l@wc — عرض الترحيبات
-wc@on / wc@off — تفعيل/تعطيل
-+r@كلمة@رد — إضافة رد
-
-[7] فلتر الكلمات
-mf@on — تشغيل الفلتر
-mf@off — إيقاف الفلتر
-+mf@كلمة — إضافة كلمة ممنوعة
--mf@كلمة — إزالة كلمة
-l@mf — عرض الكلمات
-clear@mf — حذف الكلمات
-
-[8] النشر — للماستر
-نشر نص — نشر النص في جميع الغرف
-نشر@ — اطلب الصورة ثم أرسلها، وسيتم نشرها في جميع الغرف
-نشرصورة رابط — نشر صورة برابط
-
-[9] اللغة
-lang@ar — العربية
-lang@en — English
-
-.help / help — عرض جميع الأوامر
-.more / .next — عرض القائمة التالية
-━━━━━━━━━━━━━━━━━━━━"""
+async def get_help_page(uid, p_name, advance=False):
+    if not await is_master(uid, p_name):
+        return "🚫 عرض قوائم المساعدة المتتابعة متاح للماستر فقط."
+    pages = get_help_pages()
+    page = int(HELP_PAGE_STATE.get(str(uid), 0))
+    if advance:
+        page = (page + 1) % len(pages)
+    HELP_PAGE_STATE[str(uid)] = page
+    return pages[page]
 
 
 
@@ -2224,6 +2212,11 @@ async def _draw_game_text(draw, xy, text, font, fill=(30,30,30), anchor="ma"):
             pass
     draw.text(xy, text, font=font, fill=fill, anchor=anchor)
 
+
+
+# ============================================================================
+# [قسم صور الألعاب ونتائجها] BEGIN — الصورة بعد نهاية الجولة
+# ============================================================================
 
 def render_game_card_sync(game_key, title, lines):
     """إنشاء صورة اللعبة فقط.
@@ -2263,7 +2256,10 @@ def render_game_card_sync(game_key, title, lines):
 
 
 async def send_game_card(rid, game_key, title, lines, fallback_text=None):
-    """أرسل صورة اللعبة أولاً ثم تفاصيلها كنص مستقل."""
+    """أرسل بطاقة نتيجة اللعبة بعد انتهاء الجولة فقط، ثم تفاصيل النتيجة كنص.
+    العنوان/النصوص القابلة للتعديل تحفظ في messages.json.
+    """
+    title = get_game_title(game_key, title)
     path = await asyncio.to_thread(render_game_card_sync, game_key, title, lines)
     if path:
         try:
@@ -2285,6 +2281,11 @@ async def send_game_card(rid, game_key, title, lines, fallback_text=None):
         await room_send(rid, fallback_text)
 
 
+
+# ============================================================================
+# [قسم أوامر الغرف] BEGIN
+# ============================================================================
+
 async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if await is_banned(rid, uid): return None
     p_name = await username_of(uid)
@@ -2301,9 +2302,9 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if matched_word:
             kicked, kick_error = await enforce_forbidden_word(rid, uid, p_name, matched_word)
             if kicked:
-                return f"🚫 تم الحظر بسبب الاساءه.\n👤 @{p_name}"
+                return message("moderation.filtered_ban", "🚫 تم الحظر بسبب الاساءه.")
             # الحظر المحلي يبقى فعالاً حتى لو كان خادم الغرفة رفض عملية الطرد مؤقتاً.
-            return f"🚫 تم الحظر بسبب الاساءه.\n👤 @{p_name}\n⚠️ تعذر تنفيذ الطرد من الغرفة حالياً."
+            return message("moderation.filtered_ban", "🚫 تم الحظر بسبب الاساءه.") + "\n⚠️ تعذر تنفيذ الطرد من الغرفة حالياً."
 
     # ---------------- الذكاء الاصطناعي داخل الغرفة ----------------
     # يدعم ai@السؤال وذكاء@السؤال، وكذلك التحيات المباشرة البسيطة.
@@ -2336,6 +2337,9 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     custom_reply = await execute_custom_command(rid, uid, p_name, text)
     if custom_reply is not None:
         return custom_reply
+
+    if text.strip().lower() in (".nx", "nx"):
+        return await get_help_page(uid, p_name, advance=True)
 
     if text.startswith("نشر ") or text.startswith("broadcast "):
         vip_error = await require_vip(uid, p_name, "نظام النشر")
@@ -2417,21 +2421,13 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             published = 0
             for target_rid in await all_room_ids():
                 try:
-                    caption = (
-                        "🖼️ IMAGE BROADCAST\n"
-                        ".sa Publish image\n"
-                        f"👤 {p_name}\n"
-                        f"📝 {description or 'منشور صورة'}\n\n"
-                        f"💬 Room: {source_room}\n"
-                        "━━━━━━━━━━━━━\n"
-                        f"👍 lk@{codes['like']}\n"
-                        f"❤️ lv@{codes['love']}\n"
-                        f"👎 dl@{codes['dislike']}\n"
-                        f"💬 cm@{codes['comment']} msg\n"
-                        f"🚨 report@{codes['report']} msg"
-                    )
+                    caption = message("publish.broadcast",
+                        "🖼️ IMAGE BROADCAST\n👤 {publisher}\n📝 {description}\n💬 Room: {room}\n👍 lk@{like}",
+                        publisher=p_name, description=description or "منشور صورة", room=source_room,
+                        like=codes["like"], love=codes["love"], dislike=codes["dislike"],
+                        comment=codes["comment"], report=codes["report"])
                     await room_send_media(target_rid, caption, public_media_url, m_type="image")
-                    await room_send(target_rid, "❤️ إعجاب | 👎 عدم إعجاب | ↩️ رد على الصورة")
+                    await room_send(target_rid, message("publish.reaction_hint", "❤️ إعجاب | 👎 عدم إعجاب | ↩️ رد على الصورة"))
                     published += 1
                 except Exception:
                     log.exception("publish@ failed for room %s", target_rid)
@@ -2638,6 +2634,11 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         await music_queue.put((rid, arg, "TikTok", uid, p_name))
         return f"🎵 @{p_name} جاري تنفيذ طلبك من TikTok…\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
+
+# -----------------------------------------------------------------------------
+# [لعبة الحرب] BEGIN — لعبة عالمية مشتركة بين كل الغرف
+# -----------------------------------------------------------------------------
+
     # لعبة الحرب العالمية: لاعبَان من أي غرفتين، وكل الحالة مشتركة بين جميع الغرف.
     if cmd in ("حرب", "war"):
         key = GLOBAL_WAR_KEY
@@ -2653,7 +2654,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             war_games[key] = {"p1": uid, "p1_name": p_name, "p1_room": rid, "p2": None, "p2_name": None, "p2_room": None,
                               "ship": random.randint(1, 6), "tries": {str(uid): 0}, "guesses": {str(uid): []},
                               "turn": uid, "created_at": now, "expires_at": now + 120}
-            await broadcast_media(f"🚢 حرب عالمية بدأت!\n👤 اللاعب الأول: @{p_name}\n⏳ جاري انتظار الخصم...\n🎯 اكتب «حرب» من أي غرفة للانضمام.", GAME_IMAGES["war"], m_type="image")
+            await broadcast_text(message("games.war_started", "🚢 حرب عالمية بدأت!\n👤 اللاعب الأول: @{name}", name=p_name))
             return None
         if game["p1"] == uid:
             return "⚠️ أنت داخل لعبة حرب بالفعل وتنتظر الخصم." if game.get("p2") is None else "⚠️ أنت داخل لعبة حرب بالفعل."
@@ -2661,7 +2662,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             game["p2"], game["p2_name"], game["p2_room"] = uid, p_name, rid
             game["tries"][str(uid)] = 0; game["guesses"][str(uid)] = []
             game["turn"] = game["p1"]; game["expires_at"] = now + 120
-            await broadcast_media(f"⚔️ بدأت حرب عالمية بين @{game['p1_name']} و@{p_name}!\n🏠 قد يكون اللاعبان في غرفتين مختلفتين.\n🎯 دور @{game['p1_name']} — اختر رقماً من 1 إلى 6.", GAME_IMAGES["war"], m_type="image")
+            await broadcast_text(message("games.war_joined", "⚔️ بدأت حرب عالمية بين @{p1} و@{p2}!", p1=game["p1_name"], p2=p_name))
             return None
         return "⚠️ الحرب ممتلئة. انتظر انتهاء المباراة."
 
@@ -2669,7 +2670,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         now = time.time()
         if now >= game.get("expires_at", 0):
             war_games.pop(GLOBAL_WAR_KEY, None)
-            return "⌛ انتهت الحرب بسبب انتهاء المهلة. اكتب «حرب» لبدء لعبة جديدة."
+            return message("games.war_timeout", "⌛ انتهت الحرب بسبب انتهاء المهلة. اكتب «حرب» لبدء لعبة جديدة.")
         if text.isdigit() and 1 <= int(text) <= 6:
             if game.get("p2") is None: return "⏳ انتظر اللاعب الثاني."
             if uid not in (game["p1"], game["p2"]): return "🚫 هذه اللعبة بين لاعبين آخرين."
@@ -2681,21 +2682,35 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
                 add_points(uid, p_name, 60)
                 winner_room = rooms.get(rid, "الغرفة")
                 await send_game_card(rid, "war", "⚔️ حرب | Battle", [f"🏆 الفائز: @{p_name} (+60)", f"💥 السفينة دُمّرت بواسطة @{p_name}", f"🚢 موقع السفينة: {game['ship']}"])
-                await broadcast_text(f"🏆⚔️ انتهت الحرب العالمية!\n🎉 الفائز: @{p_name} (+60)\n🚢 موقع السفينة: {game['ship']}\n🏠 الغرفة: {winner_room}")
+                await broadcast_text(message("games.war_win", "🏆⚔️ انتهت الحرب العالمية!", name=p_name, ship=game["ship"], room=winner_room))
                 war_games.pop(GLOBAL_WAR_KEY, None)
                 return None
             other = game["p2"] if uid == game["p1"] else game["p1"]
             other_key = str(other); current_tries = game["tries"].get(skey, 0); other_tries = game["tries"].get(other_key, 0)
             if current_tries >= 3 and other_tries >= 3:
-                await broadcast_text(f"🤝 انتهت الحرب العالمية دون فائز. 🚢 موقع السفينة: {game['ship']}")
+                await send_game_card(rid, "war", "⚔️ حرب | Battle", [
+                    "🤝 انتهت الحرب دون فائز",
+                    f"🚢 موقع السفينة: {game['ship']}",
+                    f"👤 @{game['p1_name']} — 3 محاولات",
+                    f"👤 @{game['p2_name']} — 3 محاولات"
+                ], "🤝 انتهت الحرب العالمية دون فائز.")
+                await broadcast_text(message("games.war_draw", "🤝 انتهت الحرب العالمية دون فائز.", ship=game["ship"]))
                 war_games.pop(GLOBAL_WAR_KEY, None); return None
             if other_tries >= 3:
                 game["turn"] = uid; next_name = p_name; remaining = 3-current_tries
             else:
                 game["turn"] = other; next_name = game["p2_name"] if uid == game["p1"] else game["p1_name"]; remaining = 3-other_tries
             game["expires_at"] = now + 120
-            await broadcast_text(f"❌ @{p_name} اختار {n} ولم يجد السفينة.\n🔄 دور @{next_name} | المحاولات المتبقية: {remaining}\n🎯 اختر رقماً من 1 إلى 6")
+            await broadcast_text(message("games.war_wrong", "❌ @{name} اختار {number} ولم يجد السفينة.", name=p_name, number=n, next_name=next_name, remaining=remaining))
             return None
+
+# -----------------------------------------------------------------------------
+# [لعبة الحرب] END
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# [لعبة سرقة] BEGIN
+# -----------------------------------------------------------------------------
 
     if cmd in ("سرقة", "rob"):
         cd_error = await require_game_cooldown(cmd)
@@ -2705,6 +2720,14 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         await send_game_card(rid, "rob", "💰 Rob | سرقة", [f"👤 اللاعب: @{p_name}", f"🏅 {'Winner | الفائز' if win else 'Loser | الخاسر'}: @{p_name}", f"💰 النتيجة: {'+25' if win else '-15'} نقطة"], f"💰 {'نجحت السرقة!' if win else 'فشلت السرقة..'} @{p_name}")
         return None
 
+# -----------------------------------------------------------------------------
+# [لعبة سرقة] END
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# [لعبة قتال] BEGIN
+# -----------------------------------------------------------------------------
+
     if cmd in ("قتال", "fight"):
         cd_error = await require_game_cooldown(cmd)
         if cd_error: return cd_error
@@ -2713,12 +2736,28 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         await send_game_card(rid, "fight", "🥊 Fight | قتال", [f"👤 اللاعب: @{p_name}", f"🏅 {'Winner | الفائز' if win else 'Loser | الخاسر'}: @{p_name}", f"💰 النتيجة: {'+15' if win else '-5'} نقطة"], f"🥊 {'هزمت خصمك!' if win else 'تلقيت ضربة قاضية..'} @{p_name}")
         return None
 
+# -----------------------------------------------------------------------------
+# [لعبة قتال] END
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# [لعبة عمل] BEGIN
+# -----------------------------------------------------------------------------
+
     if cmd in ("عمل", "job"):
         cd_error = await require_game_cooldown(cmd)
         if cd_error: return cd_error
         salary = random.randint(50, 150); add_points(uid, p_name, salary)
         await send_game_card(rid, "job", "💼 Work | عمل", [f"👤 اللاعب: @{p_name}", f"💵 الراتب: +{salary} نقطة", "🏆 النتيجة: فوز"], f"💼 عمل @{p_name} +{salary} نقطة")
         return None
+
+# -----------------------------------------------------------------------------
+# [لعبة عمل] END
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# [لعبة سباق] BEGIN
+# -----------------------------------------------------------------------------
 
     if cmd in ("سباق", "race"):
         cd_error = await require_game_cooldown(cmd)
@@ -2728,6 +2767,14 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         await send_game_card(rid, "race", "🏁 Race | سباق", [f"👤 اللاعب: @{p_name}", f"🏅 {'Winner | الفائز' if win else 'Loser | الخاسر'}: @{p_name}", f"💰 النتيجة: {'+30' if win else '-10'} نقطة"], f"🏁 {'فزت بالسباق!' if win else 'تعطلت سيارتك..'} @{p_name}")
         return None
 
+# -----------------------------------------------------------------------------
+# [لعبة سباق] END
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# [لعبة كف] BEGIN
+# -----------------------------------------------------------------------------
+
     if cmd in ("كف", "slap"):
         game = kaf_games.get(f"slap_{rid}")
         if not game:
@@ -2735,7 +2782,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             if cd_error:
                 return cd_error
             kaf_games[f"slap_{rid}"] = {"player1": uid, "p1_name": p_name}
-            await send_game_card(rid, "slap", "👏💢 Slap | كف 💢👏", [f"👤 @{p_name}", "⏳ جاري انتظار الخصم", "🎮 اكتب كف للانضمام"], f"⏳ @{p_name} جاري انتظار الخصم...")
+            return f"⏳ @{p_name} جاري انتظار الخصم..."
         else:
             if game["player1"] == uid: return "⚠️ أنت تنتظر منافس!"
             p1_name = game["p1_name"]
@@ -2744,6 +2791,14 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             add_points(uid if winner == p_name else game["player1"], winner, 15)
             await send_game_card(rid, "slap", "👏💢 Slap | كف 💢👏", [f"🥊 @{p1_name} × @{p_name}", f"🏅 Winner | الفائز: @{winner} (+15)", "💔 Loser | الخاسر: اللاعب الآخر (-10)"], f"👏💢 Slap | كف 💢👏\n🏆 الفائز: @{winner}")
         return None
+
+# -----------------------------------------------------------------------------
+# [لعبة كف] END
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# [لعبة مضاربة] BEGIN
+# -----------------------------------------------------------------------------
 
     if cmd in ("مضاربة", "bet"):
         try: amount = int(arg)
@@ -2757,7 +2812,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             if cd_error:
                 return cd_error
             kaf_games[game_key] = {"player1": uid, "p1_name": p_name, "amount": amount}
-            await send_game_card(rid, "bet", "🎲 Bet | مضاربة", [f"👤 اللاعب: @{p_name}", f"💰 الرهان: {amount} نقطة", "⏳ جاري انتظار الخصم"], f"🎲 @{p_name} يراهن بـ {amount} نقطة")
+            return f"🎲 @{p_name} يراهن بـ {amount} نقطة. ⏳ جاري انتظار الخصم"
             async def bot_bet():
                 await asyncio.sleep(30)
                 g = kaf_games.get(game_key)
@@ -2778,26 +2833,69 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             await send_game_card(rid, "bet", "🎲 Bet | مضاربة", [f"🥊 @{p1_name} × @{p_name}", f"🏆 Winner | الفائز: @{winner}", f"💰 الرهان: {amount} نقطة"], f"🎲 تمت المضاربة بين @{p1_name} و @{p_name}..\n🏆 الفائز: @{winner}")
         return None
 
+# [لعبة مضاربة] END
+
+
     if cmd in ("طرد", "kick"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
         target = arg.replace("@", "").strip()
-        rows, _ = await table_select(lambda: sb.table("profiles").select("id").eq("username", target).limit(1).execute())
+        if not target: return "❌ الصيغة: طرد @اسم_المستخدم"
+        rows, _ = await table_select(
+            lambda: sb.table("profiles").select("id").eq("username", target).limit(1).execute()
+        )
         if not rows: return "❌ المستخدم غير موجود."
-        await rpc("room_leave", {"_room": rid, "_user": rows[0]["id"]})
-        return f"👞 تم طرد @{target}."
+
+        tid = str(rows[0]["id"])
+        _, err = await rpc("kick_room_member", {"_room": rid, "_user": tid})
+        if err:
+            log.error("kick_room_member failed rid=%s uid=%s: %s", rid, tid, err)
+            return f"❌ فشل الطرد الحقيقي: {err}"
+        return message("moderation.kick", "👞 تم طرد @{name}.", name=target)
 
     if cmd in ("حظر", "ban"):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
         target = arg.replace("@", "").strip()
-        rows, _ = await table_select(lambda: sb.table("profiles").select("id").eq("username", target).limit(1).execute())
+        if not target: return "❌ الصيغة: حظر @اسم_المستخدم"
+        rows, _ = await table_select(
+            lambda: sb.table("profiles").select("id,username").eq("username", target).limit(1).execute()
+        )
         if not rows: return "❌ المستخدم غير موجود."
-        tid = rows[0]["id"]; bans = load_bans()
-        if rid not in bans: bans[rid] = []
-        if tid not in bans[rid]:
-            bans[rid].append(tid); save_bans(bans)
-            await rpc("room_leave", {"_room": rid, "_user": tid})
-            return f"🚫 تم حظر @{target}."
-        return "⚠️ محظور بالفعل."
+
+        tid = str(rows[0]["id"])
+        real_name = rows[0].get("username") or target
+
+        # المصدر الوحيد للحظر هو نظام الغرفة نفسه:
+        # ban_room_member يضيف المستخدم إلى room_bans ويزيله من الغرفة.
+        _, err = await rpc("ban_room_member", {
+            "_room": rid,
+            "_user": tid,
+            "_reason": f"حظر بواسطة الماستر @{p_name}",
+        })
+        if err:
+            log.error("ban_room_member failed rid=%s uid=%s: %s", rid, tid, err)
+            return f"❌ فشل الحظر الحقيقي من الغرفة: {err}"
+
+        # تحقق من أن الاسم ظهر فعلياً في قائمة حظر الغرفة.
+        verify_rows, verify_err = await table_select(
+            lambda: sb.table("room_bans")
+            .select("user_id")
+            .eq("room_id", rid)
+            .eq("user_id", tid)
+            .limit(1)
+            .execute()
+        )
+        if verify_err or not verify_rows:
+            log.error(
+                "ban RPC succeeded but room_bans verification failed rid=%s uid=%s err=%s",
+                rid, tid, verify_err
+            )
+            return "⚠️ تم تنفيذ طلب الحظر، لكن تعذر التحقق من ظهوره في قائمة محظوري الغرفة."
+
+        return message(
+            "moderation.ban",
+            "🚫 تم حظر @{name} من الغرفة وإضافته إلى قائمة المحظورين.",
+            name=real_name
+        )
 
     if cmd == "نقاطي":
         p, d = get_user_data(uid, p_name)
@@ -2813,8 +2911,16 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             msg += f"{emojis[i]} @{d['username']} ➔ {d['points']} ن\n"
         return msg + "━━━━━━━━━━━━━━━━━━━━"
 
+
+# -----------------------------------------------------------------------------
+# [الألعاب الفردية المصورة] BEGIN — عدّل الألعاب من games_map
+# -----------------------------------------------------------------------------
+
     # بقية الألعاب مع صور
+    # كل سطر أدناه لعبة مستقلة. عدّل الاسم/الصورة/الربح/الخسارة/نسبة الفوز هنا.
+    # [لعبة رشوة] BEGIN/END: السطر الخاص بها داخل القاموس فقط.
     games_map = {
+
         "رشوة": ("bribe", 100, -50, 30, "💰 نجحت الرشوة!", "👮 تم القبض عليك!"),
         "سلة": ("basket", 15, 0, 50, "🏀 رمية ثلاثية!", "🏀 ضاعت الكرة.."),
         "قصف": ("drone", 20, 0, 100, "💣 انفجار هائل!", ""),
@@ -2851,11 +2957,6 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         except Exception:
             delta = 20 if win else -5
         add_points(uid, p_name, delta)
-        if custom.get("image_url"):
-            try:
-                await room_send_media(rid, "", custom.get("image_url"), m_type="image")
-            except Exception:
-                pass
         await send_custom_game_result(rid, custom, p_name, win)
         msg = custom.get("win_message") if win else custom.get("lose_message")
         return f"🧪 اختبار: {msg or ('🎉 فوز!' if win else '😅 خسارة!')} @{p_name}\n💰 {'+' if delta >= 0 else ''}{delta} نقطة"
@@ -2874,11 +2975,6 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         win = random.randint(1, 100) <= int(custom.get("win_chance", 50))
         delta = int(custom.get("win_points", 20)) if win else int(custom.get("lose_points", -5))
         add_points(uid, p_name, delta)
-        if custom.get("image_url"):
-            try:
-                await room_send_media(rid, "", custom.get("image_url"), m_type="image")
-            except Exception:
-                pass
         await send_custom_game_result(rid, custom, p_name, win)
         msg = custom.get("win_message") if win else custom.get("lose_message")
         return f"{msg} @{p_name}\n💰 {'+' if delta >= 0 else ''}{delta} نقطة"
@@ -2893,6 +2989,14 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         await send_game_card(rid, key, f"🎮 {cmd}", [f"👤 اللاعب: @{p_name}", f"🏅 {'Winner | الفائز' if win else 'Loser | الخاسر'}: @{p_name}", f"💰 النتيجة: {win_p if win else lose_p} نقطة"], f"{win_m if win else lose_m} @{p_name}\n💰 النتيجة: {win_p if win else lose_p} ن.")
         return None
 
+# -----------------------------------------------------------------------------
+# [الألعاب الفردية المصورة] END
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# [لعبة تعدين] BEGIN
+# -----------------------------------------------------------------------------
+
     if cmd == "تعدين":
         cd_error = await require_game_cooldown(cmd)
         if cd_error:
@@ -2900,6 +3004,14 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         found = random.randint(200, 500); add_points(uid, p_name, found)
         await send_game_card(rid, "mine", "⛏️ Mine | تعدين", [f"👤 اللاعب: @{p_name}", "🏆 Winner | الفائز", f"💰 النتيجة: +{found} نقطة"], f"⛏️ وجدت ذهباً! @{p_name} +{found} ن.")
         return None
+
+# -----------------------------------------------------------------------------
+# [لعبة تعدين] END
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# [لعبة زواج] BEGIN
+# -----------------------------------------------------------------------------
 
     if cmd == "زواج":
         cd_error = await require_game_cooldown(cmd)
@@ -2913,13 +3025,20 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         await send_game_card(rid, "marriage", "💍 Marriage | زواج", [f"👤 اللاعب: @{p_name}", f"❤️ الشريك: @{partner}", "🏆 تمت العملية بنجاح"], f"❤️ مبروك زواج @{p_name} من @{partner} 💍")
         return None
 
+# [لعبة زواج] END
+
+
     if cmd in ("تخطي", "skip"):
         ok, out = await skip(rid); return out
     if cmd in ("ايقاف", "stop"):
         ok, out = await stop(rid); return out
-    if cmd in ("مساعدة", "help", ".help"): return HELP_ROOM
+    if cmd in ("مساعدة", "help", ".help"): return await get_help_page(uid, p_name, advance=False)
     
     return None
+
+# ============================================================================
+# [قسم أوامر الغرف] END
+# ============================================================================
 
 # ----------------------------- الحلقات -----------------------------
 # المطور المنفصل: الألعاب الجديدة تُحفظ في testing ولا تدخل التشغيل حتى اعتمادها.
@@ -2931,6 +3050,12 @@ except Exception:
 # ----------------------------- الذكاء الاصطناعي / الصيانة -----------------------------
 Path(TESTING_GAMES_PATH).parent.mkdir(parents=True, exist_ok=True)
 Path(APPROVED_GAMES_DIR).mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================================
+# [قسم الألعاب المخصصة + لعبة مليون] BEGIN
+# هنا تُعرّف/تعدل الألعاب المخصصة، ومن ضمنها مليون إذا كانت موجودة في JSON.
+# ============================================================================
 
 def load_custom_games():
     # التشغيل يقرأ الألعاب المعتمدة فقط.
@@ -3512,6 +3637,11 @@ async def add_ai_game(uid, description):
             "image_prompt": str(data.get("image_prompt") or f"بطاقة لعبة {name} في Giant Chat")[:1000],
         }
 
+
+# -----------------------------------------------------------------------------
+# [لعبة مليون] BEGIN — إعدادات لعبة مليون التي ينشئها المصمم
+# -----------------------------------------------------------------------------
+
         # لعبة «مليون»: المليون جائزة الفوز فقط، وليس جائزة مضمونة كل مرة.
         # النتيجة عشوائية بنسبة 50% ما لم يطلب الماستر نسبة أخرى صراحة.
         if normalize_text(name) == "مليون" or command == "مليون":
@@ -3522,6 +3652,10 @@ async def add_ai_game(uid, description):
             data["win_message"] = "🎉 تم الحصول على مليون!"
             data["lose_message"] = "😔 حظًا سعيدًا، جرب في المرة القادمة."
             data["image_prompt"] = "بطاقة لعبة مليون فاخرة، رقم 1,000,000، أسلوب ألعاب دردشة، بدون كتابة اسم اللاعب"
+
+# -----------------------------------------------------------------------------
+# [لعبة مليون] END — لا تغيّر ما بعده إذا كنت تعدّل إعدادات المليون فقط
+# -----------------------------------------------------------------------------
         # ضع اللعبة في بيئة الاختبار فقط، وليس custom_games.json.
         testing = load_testing_games()
         data["status"] = "testing"
@@ -3574,7 +3708,7 @@ def self_repair_sync():
     results=[]
     for path, default in [
         (CONFIG_PATH, dict(C)), (POINTS_PATH, {}), (REPLIES_PATH, {}), (MASTERS_PATH, []),
-        (BANS_PATH, {}), (ROOMS_PATH, {}), (MODERATION_PATH, {"enabled":{},"words":[]}),
+        (ROOMS_PATH, {}), (MODERATION_PATH, {"enabled":{},"words":[]}),
         (WELCOME_PATH, {}), (PUBLISHED_POSTS_PATH, {}), (SOCIAL_EVENTS_PATH, {}),
         (VIP_USERS_PATH, {}), (CUSTOM_GAMES_PATH, {}), (CUSTOM_COMMANDS_PATH, {}),
         (TESTING_GAMES_PATH, {}), (TESTING_STATE_PATH, {}),
@@ -3616,6 +3750,10 @@ async def delete_game_definition(command):
         Path(APPROVED_GAMES_DIR, f"{key}.json").unlink(missing_ok=True)
     except Exception: pass
     return removed
+
+# ============================================================================
+# [قسم الألعاب المخصصة + لعبة مليون] END
+# ============================================================================
 
 async def handle_ai_dm(sender, text):
     if (await username_of(sender)).lower() != OWNER:
