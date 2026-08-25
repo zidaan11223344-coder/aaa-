@@ -2430,9 +2430,13 @@ async def play_track(rid, track, source_label, requester_id, requester_name, int
         for target_rid in await all_room_ids():
             try:
                 if media:
-                    await room_send_media(target_rid, caption, media, m_type="voice", duration_ms=duration_ms)
+                    # Giant Chat قد يخفي عنوان رسالة الصوت، لذلك نرسل التفاعل كنص مستقل بعدها.
+                    attachment_caption = message("music.attachment_caption", "🎵 {title}", title=title)
+                    await room_send_media(target_rid, attachment_caption, media, m_type="voice", duration_ms=duration_ms)
                 else:
-                    await room_send(target_rid, message("music.interactive_direct", "{caption}\n▶️ {url}", caption=caption, url=direct_url))
+                    attachment_caption = message("music.interactive_direct", "🎵 {title}\n▶️ {url}", title=title, url=direct_url)
+                    await room_send(target_rid, attachment_caption)
+                await room_send(target_rid, message("music.interaction_after_media", "{caption}", caption=caption))
             except Exception:
                 log.exception("interactive .sa send failed for room %s", target_rid)
 
@@ -2768,7 +2772,8 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         published = 0
         for target_rid in await all_room_ids():
             caption = message("publish.broadcast", "🖼️ {description}\n👤 @{publisher}\n🏠 {room}\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} نص\n🚨 report@{report} سبب", publisher=p_name, description=image_title, source_label=source_room, code=codes["like"], room=source_room, like=codes["like"], love=codes["love"], dislike=codes["dislike"], comment=codes["comment"], report=codes["report"])
-            await room_send_media(target_rid, caption, url, m_type="image")
+            await room_send_media(target_rid, message("publish.attachment_caption", "🖼️ {description}", description=image_title), url, m_type="image")
+            await room_send(target_rid, message("publish.interaction_after_media", "{caption}", caption=caption))
             published += 1
         log.info("image publish completed rooms=%s sender=%s", published, p_name)
         return None
@@ -2845,7 +2850,8 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
                         publisher=p_name, description=image_title, source_label=source_room, code=codes["like"], room=source_room,
                         like=codes["like"], love=codes["love"], dislike=codes["dislike"],
                         comment=codes["comment"], report=codes["report"])
-                    await room_send_media(target_rid, caption, public_media_url, m_type="image")
+                    await room_send_media(target_rid, message("publish.attachment_caption", "🖼️ {description}", description=image_title), public_media_url, m_type="image")
+                    await room_send(target_rid, message("publish.interaction_after_media", "{caption}", caption=caption))
                     published += 1
                 except Exception:
                     log.exception("publish@ failed for room %s", target_rid)

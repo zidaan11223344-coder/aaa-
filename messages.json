@@ -5,13 +5,17 @@
     "request_started": "🎵 @{requester_name} — جاري تنفيذ طلبك من {source}\n🔎 البحث عن: {query}\n🏠 الغرفة: {room}",
     "interactive_request_started": "📢 @{requester_name} — جاري تجهيز نشر الأغنية التفاعلي\n🔎 البحث عن: {query}\n🏠 الغرفة الأصلية: {room}",
     "direct_link": "🎵 @{requester_name} — جاري تشغيل: {title}\n🏠 الغرفة: {room}\n▶️ {url}",
-    "interactive_direct": "{caption}\n▶️ {url}",
+    "attachment_caption": "🎵 {title}",
+    "interactive_direct": "🎵 {title}\n▶️ {url}",
+    "interaction_after_media": "{caption}",
     "local_caption": "🎵 {title}\n🎤 {artist}\n👤 الطلب بواسطة: @{requester_name}\n🏠 الغرفة: {room}"
   },
   "publish": {
     "broadcast": "🖼️ نشر صورة تفاعلي\n👤 الناشر: @{publisher}\n📝 الوصف: {description}\n🏠 الغرفة الأصلية: {room}\n━━━━━━━━━━━━━\n👍 إعجاب: lk@{like}\n❤️ أحببته: lv@{love}\n👎 عدم إعجاب: dl@{dislike}\n💬 تعليق: cm@{comment} نص_التعليق\n🚨 إبلاغ: report@{report} السبب",
     "text_broadcast": "📢 {body}",
     "default_image_title": "منشور صورة",
+    "attachment_caption": "🖼️ {description}",
+    "interaction_after_media": "{caption}",
     "pending_prompt": "🖼️ أرسل الصورة الآن خلال دقيقتين، وسيتم نشرها في كل الغرف مع الوصف الذي كتبته.",
     "non_image": "⚠️ الملف المرسل ليس صورة. أرسل صورة بعد أمر نشر@.",
     "direct_text_sent": "✅ تم نشر الرسالة في كل الغرف."
