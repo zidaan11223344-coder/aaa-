@@ -162,12 +162,20 @@ SEARCH_URL = C.get("music_search_url") or "https://giant-chat-app.lovable.app/ap
 YOUTUBE_COOKIES_PATH = str(C.get("youtube_cookies_path", "youtube_cookies.txt")).strip()
 # أسرار cookies يمكن حفظها كمتغيرات Railway، ولا يجب رفعها إلى GitHub.
 YOUTUBE_COOKIES_ENV = os.environ.get("YOUTUBE_COOKIES", "").strip()
+YOUTUBE_COOKIES_B64_ENV = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
 # Optional multiple YouTube sessions. Use only cookies belonging to accounts you control.
 # The bot never prints the cookie contents.
 YOUTUBE_COOKIE_ENVS = [
     (name, os.environ.get(name, "").strip())
     for name in ["YOUTUBE_COOKIES", *[f"YOUTUBE_COOKIES_{i}" for i in range(1, 11)]]
 ]
+
+if YOUTUBE_COOKIES_B64_ENV:
+    try:
+        _decoded_youtube_cookies = base64.b64decode(YOUTUBE_COOKIES_B64_ENV).decode("utf-8")
+        YOUTUBE_COOKIE_ENVS.append(("YOUTUBE_COOKIES_B64", _decoded_youtube_cookies))
+    except Exception as _cookie_decode_error:
+        log.warning("YOUTUBE_COOKIES_B64 غير صالح؛ سيُتجاهل: %s", type(_cookie_decode_error).__name__)
 YOUTUBE_COOKIE_FILES = []
 YOUTUBE_COOKIE_INDEX = 0
 TIKTOK_COOKIES_ENV = os.environ.get("TIKTOK_COOKIES", "").strip()
@@ -3942,11 +3950,15 @@ async def run_repair_check(kind):
                 f"• الألعاب المضافة بالذكاء: {len(load_custom_games())}\n"
                 f"• الغرف الحالية: {len(rooms)}")
     if kind in ("موسيقى", "music", "اغاني"):
+        cookie_ok, cookie_status = youtube_cookie_status()
         checks = []
         checks.append(f"yt-dlp: {'OK' if yt_dlp else 'MISSING'}")
         checks.append(f"ffmpeg: {'OK' if shutil.which('ffmpeg') else 'MISSING'}")
         checks.append(f"YouTube sessions: {len(YOUTUBE_COOKIE_FILES)}")
-        return "🎵 فحص الموسيقى\n• " + "\n• ".join(checks) + "\n💡 إذا كان البحث يفشل أرسل: اصلاح ذكي مشكلة الموسيقى"
+        status = message("music.cookie_status_ready", "✅ جاهزة") if cookie_ok else message("music.cookie_status_missing", "⚠️ غير جاهزة")
+        checks.append(message("music.cookie_check", "حالة جلسة YouTube: {status}", status=status))
+        checks.append(message("music.cookie_check_detail", "تفاصيل الجلسة: {detail}", detail=cookie_status))
+        return message("music.diagnostic_result", "🎵 فحص الموسيقى\n• {checks}\n💡 أضف YOUTUBE_COOKIES أو YOUTUBE_COOKIES_B64 إلى Railway ثم أعد النشر إذا لم تكن الجلسة جاهزة.", checks="\n• ".join(checks))
     if kind in ("العاب", "ألعاب", "games"):
         asset_dir = BASE_DIR / "assets"
         imgs = list(asset_dir.glob("game_*.jpg")) + list(asset_dir.glob("game_*.png")) if asset_dir.is_dir() else []

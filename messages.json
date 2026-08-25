@@ -8,6 +8,11 @@
     "attachment_caption": "🎵 {title}",
     "interactive_direct": "🎵 {title}\n▶️ {url}",
     "interaction_after_media": "{caption}",
+    "cookie_status_ready": "✅ جاهزة",
+    "cookie_status_missing": "⚠️ غير جاهزة",
+    "cookie_check": "حالة جلسة YouTube: {status}",
+    "cookie_check_detail": "تفاصيل الجلسة: {detail}",
+    "diagnostic_result": "🎵 فحص الموسيقى\n• {checks}\n💡 أضف YOUTUBE_COOKIES أو YOUTUBE_COOKIES_B64 إلى Railway ثم أعد النشر إذا لم تكن الجلسة جاهزة.",
     "local_caption": "🎵 {title}\n🎤 {artist}\n👤 الطلب بواسطة: @{requester_name}\n🏠 الغرفة: {room}"
   },
   "publish": {
