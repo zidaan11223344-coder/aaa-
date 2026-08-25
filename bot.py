@@ -466,6 +466,13 @@ def message(key, default="", **kwargs):
         return template.format(**kwargs)
     except Exception:
         return template
+
+def resolve_message_override(text):
+    """يتيح تعديل رسائل الأوامر القديمة من messages.json دون إعادة كتابة منطقها."""
+    source = str(text or "")
+    overrides = load_messages().get("overrides", {})
+    return str(overrides.get(source, source)) if isinstance(overrides, dict) else source
+
 def save_mutes(m): save_json(MUTES_PATH, m)
 def load_rooms_saved(): return load_json(ROOMS_PATH, {})
 def save_rooms_saved(r): save_json(ROOMS_PATH, r)
@@ -512,8 +519,12 @@ async def require_vip(uid, username, feature="هذه الخدمة"):
         return None
     if await is_vip(uid, username):
         return None
-    return (f"🔒 @{username} هذه {feature} تتطلب توثيق الحساب من صاحب البوت.\n"
-            f"📌 طريقة التوثيق: صاحب البوت يكتب vip@اسم_المستخدم")
+    return message(
+        "access.vip_required",
+        "🔒 @{username} هذه {feature} تتطلب توثيق الحساب من صاحب البوت.\n📌 طريقة التوثيق: صاحب البوت يكتب vip@اسم_المستخدم",
+        username=username,
+        feature=feature,
+    )
 
 async def set_verification_enabled(enabled):
     global VERIFICATION_ENABLED
@@ -1238,11 +1249,13 @@ async def send_gift_command(rid, sender_uid, sender_name, raw_text):
 # ============================================================================
 
 async def room_send(rid, text):
+    text = resolve_message_override(text)
     await run(lambda: sb.table("room_messages").insert({
         "room_id": rid, "user_id": BOT_ID, "content": text, "message_type": "text"
     }).execute())
 
 async def room_send_media(rid, text, media_url, m_type="text", duration_ms=None):
+    text = resolve_message_override(text)
     payload = {
         "room_id": rid,
         "user_id": BOT_ID,
@@ -1254,6 +1267,7 @@ async def room_send_media(rid, text, media_url, m_type="text", duration_ms=None)
     await run(lambda: sb.table("room_messages").insert(payload).execute())
 
 async def dm_send(uid, text):
+    text = resolve_message_override(text)
     envelope = {
         "v": 1, "id": str(uuid.uuid4()), "content": text, "message_type": "text",
         "media_url": None, "media_duration_ms": None, "reply_to_id": None, "created_at": now_iso()
@@ -1264,6 +1278,7 @@ async def dm_send(uid, text):
     return not bool(error)
 
 async def dm_send_media(uid, text, media_url, m_type="image"):
+    text = resolve_message_override(text)
     envelope = {
         "v": 1, "id": str(uuid.uuid4()), "content": text or "", "message_type": m_type,
         "media_url": media_url, "media_duration_ms": None, "reply_to_id": None, "created_at": now_iso()
@@ -2991,7 +3006,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     cmd, arg = parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
 
     GAME_COMMANDS = {"عمل","job","كف","slap","مضاربة","bet","حرب","war","سرقة","rob","قتال","fight",
-                     "سباق","race","رشوة","سلة","قصف","اضرب","ورق","سدد","ملاكمة","بركان","شبح","حظ","نرد","تعدين","زواج","marriage"}
+                     "سباق","race","رشوة","سلة","قصف","اضرب","ورق","سدد","ملاكمة","بركان","شبح","حظ","نرد","تعدين","زواج","marriage","علاقة","علاقه","relationship"}
 
     async def require_game_cooldown(game_command, cooldown_seconds=None):
         interval = int(cooldown_seconds if cooldown_seconds is not None else C.get("game_cooldown_seconds", 30))
@@ -3480,16 +3495,34 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
 # [لعبة زواج] BEGIN
 # -----------------------------------------------------------------------------
 
-    if cmd == "زواج":
-        cd_error = await require_game_cooldown(cmd)
+    if cmd in ("زواج", "marriage", "علاقة", "علاقه", "relationship"):
+        cd_error = await require_game_cooldown("relationship")
         if cd_error: return cd_error
         pts, d = get_user_data(uid, p_name)
-        if d.get("married_to"): return f"💍 متزوج من @{d['married_to']}"
-        others = [u["username"] for i, u in pts.items() if i != uid]
-        if not others: return "💔 لا أحد للزواج."
-        partner = random.choice(others); d["married_to"] = partner
+        others = [str(u.get("username") or i) for i, u in pts.items() if str(i) != str(uid)]
+        if not others:
+            return message("relationship.no_partner", "💔 لا يوجد مستخدم آخر لبدء علاقة.")
+        relation_config = load_messages().get("relationship", {})
+        relationships = relation_config.get("types", []) if isinstance(relation_config, dict) else []
+        relationships = [str(item).strip() for item in relationships if str(item).strip()]
+        if not relationships:
+            relationships = ["صداقة قوية", "حب من النظرة الأولى", "توأم روح", "شراكة مميزة"]
+        previous = str(d.get("last_relationship_type") or "")
+        selectable = [item for item in relationships if item != previous] or relationships
+        partner = random.choice(others)
+        relationship = random.choice(selectable)
+        compatibility = random.randint(55, 99)
+        d["last_relationship_type"] = relationship
         pts[uid] = d; save_json(POINTS_PATH, pts)
-        await send_game_card(rid, "marriage", "💍 Marriage | زواج", [f"👤 اللاعب: @{p_name}", f"❤️ الشريك: @{partner}", "🏆 تمت العملية بنجاح"], f"❤️ مبروك زواج @{p_name} من @{partner} 💍")
+        title = message("relationship.title", "💞 العلاقة | Relationship")
+        details = [
+            message("relationship.player", "👤 الطرف الأول: @{player}", player=p_name),
+            message("relationship.partner", "👤 الطرف الثاني: @{partner}", partner=partner),
+            message("relationship.type_line", "🔮 العلاقة: {relationship}", relationship=relationship),
+            message("relationship.compatibility", "💘 نسبة التوافق: {compatibility}%", compatibility=compatibility),
+        ]
+        result = message("relationship.result", "💞 العلاقة: {relationship}\n👤 @{player} مع @{partner}\n💘 نسبة التوافق: {compatibility}%", relationship=relationship, player=p_name, partner=partner, compatibility=compatibility)
+        await send_game_card(rid, "marriage", title, details, result)
         return None
 
 # [لعبة زواج] END
