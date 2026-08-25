@@ -2392,7 +2392,7 @@ async def render_music_card(track, requester_name, source_room):
 
 # [الأغاني] تشغيل المسار — بداية
 
-async def play_track(rid, track, source_label, requester_id, requester_name):
+async def play_track(rid, track, source_label, requester_id, requester_name, interactive_broadcast=False):
     if not track:
         return False, "لم أجد المقطع المطلوب"
     source_room = rooms.get(rid, "الغرفة")
@@ -2404,27 +2404,63 @@ async def play_track(rid, track, source_label, requester_id, requester_name):
     title = track.get("title", "المقطع")
     artist = track.get("artist", source_label)
     media_url = track.get("audio_url")
+    async def send_interactive_music(media=None, direct_url=None):
+        """نشر خاص بأمر .sa: يسجّل أكواد التفاعل ويستخدم قالب messages.json."""
+        post_id = str(uuid.uuid4())
+        posts = load_published_posts()
+        posts[post_id] = {
+            "post_id": post_id,
+            "owner_id": str(requester_id),
+            "owner_name": requester_name,
+            "source_room_id": str(rid),
+            "media_url": media or direct_url or "",
+            "type": "music",
+            "title": title,
+            "created_at": now_iso(),
+        }
+        save_published_posts(posts)
+        codes = await register_social_codes(post_id, requester_id, requester_name, "music", title, rid)
+        caption = message(
+            "music.broadcast",
+            "🎵 نشر أغنية تفاعلي\n🎤 الطلب بواسطة: @{requester_name}\n🎶 {title}\n🏠 الغرفة: {room}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} نص\n🚨 report@{report} سبب",
+            requester_name=requester_name, title=title, source_label=source_label, room=source_room,
+            code=codes["like"], like=codes["like"], love=codes["love"], dislike=codes["dislike"],
+            comment=codes["comment"], report=codes["report"],
+        )
+        for target_rid in await all_room_ids():
+            try:
+                if media:
+                    await room_send_media(target_rid, caption, media, m_type="voice", duration_ms=duration_ms)
+                else:
+                    await room_send(target_rid, message("music.interactive_direct", "{caption}\n▶️ {url}", caption=caption, url=direct_url))
+            except Exception:
+                log.exception("interactive .sa send failed for room %s", target_rid)
+
     if not media_url:
         direct_url = track.get("youtube_url") or track.get("spotify_url") or track.get("tiktok_url")
         if direct_url:
-            await room_send(rid, message("music.direct_link", "🎵 @{requester_name} — جاري تشغيل: {title}\n🏠 الغرفة: {room}\n▶️ {url}", requester_name=requester_name, title=title, room=source_room, url=direct_url))
+            if interactive_broadcast:
+                duration_ms = 0
+                await send_interactive_music(direct_url=direct_url)
+            else:
+                await room_send(rid, message("music.direct_link", "🎵 @{requester_name} — جاري تشغيل: {title}\n🏠 الغرفة: {room}\n▶️ {url}", requester_name=requester_name, title=title, room=source_room, url=direct_url))
             return True, None
         return False, "تم الوصول للنتيجة لكن لم يتم إنشاء ملف صوتي ولا رابط تشغيل مباشر."
 
-    # التشغيل يبقى في الغرفة التي طلبت الأغنية فقط، بلا أكواد أو تفاعلات اجتماعية.
+    # تشغيل و.تشغيل وتيك تبقى محلية بلا أكواد؛ .sa فقط ينشر رسالة التفاعل.
     try:
         duration_ms = int(track.get("duration_ms") or (float(track.get("duration") or 0) * 1000))
         if duration_ms <= 0:
             raise RuntimeError("مدة الصوت صفر؛ تم منع إرسال بصمة صوت فارغة")
-        caption = message(
-            "music.local_caption",
-            "🎵 {title}\n🎤 {artist}\n👤 الطلب بواسطة: @{requester_name}\n🏠 الغرفة: {room}",
-            title=title,
-            artist=artist,
-            requester_name=requester_name,
-            room=source_room,
-        )
-        await room_send_media(rid, caption, media_url, m_type="voice", duration_ms=duration_ms)
+        if interactive_broadcast:
+            await send_interactive_music(media=media_url)
+        else:
+            caption = message(
+                "music.local_caption",
+                "🎵 {title}\n🎤 {artist}\n👤 الطلب بواسطة: @{requester_name}\n🏠 الغرفة: {room}",
+                title=title, artist=artist, requester_name=requester_name, room=source_room,
+            )
+            await room_send_media(rid, caption, media_url, m_type="voice", duration_ms=duration_ms)
     except Exception as exc:
         log.exception("music local send failed room=%s", rid)
         await report_music_error_to_masters(
@@ -2460,7 +2496,7 @@ async def music_worker_queue():
     interval = max(0, int(C.get("music_interval_seconds", 0)))
     while True:
         item = await music_queue.get()
-        rid, query, source, requester_id, requester_name = item
+        rid, query, source, requester_id, requester_name, interactive_broadcast = (*item, False) if len(item) == 5 else item
         try:
             wait = interval - (time.time() - last_music_started)
             if wait > 0:
@@ -2488,7 +2524,7 @@ async def music_worker_queue():
                 await room_send(rid, friendly_music_error(err))
                 await report_music_error_to_masters(rid, source, query, err, stage="البحث/الاتصال")
             else:
-                ok, out = await play_track(rid, track, used_source, requester_id, requester_name)
+                ok, out = await play_track(rid, track, used_source, requester_id, requester_name, interactive_broadcast=interactive_broadcast)
                 if not ok and out:
                     await room_send(rid, friendly_music_error(out))
                     await report_music_error_to_masters(rid, used_source, query, out, stage="التنزيل/التجهيز/الإرسال")
@@ -2716,21 +2752,22 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         vip_error = await require_vip(uid, p_name, "نظام النشر")
         if vip_error: return vip_error
         msg = text.split(maxsplit=1)[1].strip()
-        await broadcast_text("📢 " + msg)
+        await broadcast_text(message("publish.text_broadcast", "📢 {body}", body=msg, publisher=p_name, room=rooms.get(rid, "الغرفة")))
         return message("publish.direct_text_sent", "✅ تم نشر الرسالة في كل الغرف.")
     if text.startswith("نشرصورة ") or text.startswith("broadcast_image "):
         vip_error = await require_vip(uid, p_name, "نظام النشر")
         if vip_error: return vip_error
         url = text.split(maxsplit=1)[1].strip()
         source_room = rooms.get(rid, "الغرفة")
+        image_title = message("publish.default_image_title", "منشور صورة")
         post_id = str(uuid.uuid4())
         posts = load_published_posts()
-        posts[post_id] = {"post_id": post_id, "owner_id": str(uid), "owner_name": p_name, "source_room_id": str(rid), "media_url": url, "type": "image", "title": "منشور صورة", "created_at": now_iso()}
+        posts[post_id] = {"post_id": post_id, "owner_id": str(uid), "owner_name": p_name, "source_room_id": str(rid), "media_url": url, "type": "image", "title": image_title, "created_at": now_iso()}
         save_published_posts(posts)
-        codes = await register_social_codes(post_id, uid, p_name, "image", "منشور صورة", rid)
+        codes = await register_social_codes(post_id, uid, p_name, "image", image_title, rid)
         published = 0
         for target_rid in await all_room_ids():
-            caption = message("publish.broadcast", "", publisher=p_name, description="منشور صورة", source_label=source_room, code=codes["like"], room=source_room, like=codes["like"], love=codes["love"], dislike=codes["dislike"], comment=codes["comment"], report=codes["report"])
+            caption = message("publish.broadcast", "🖼️ {description}\n👤 @{publisher}\n🏠 {room}\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} نص\n🚨 report@{report} سبب", publisher=p_name, description=image_title, source_label=source_room, code=codes["like"], room=source_room, like=codes["like"], love=codes["love"], dislike=codes["dislike"], comment=codes["comment"], report=codes["report"])
             await room_send_media(target_rid, caption, url, m_type="image")
             published += 1
         log.info("image publish completed rooms=%s sender=%s", published, p_name)
@@ -2793,18 +2830,19 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         elif message_type in ("image", "photo", "sticker") and media_url:
             publish_pending.pop(publish_key, None)
             source_room = rooms.get(rid, "الغرفة")
+            image_title = description or message("publish.default_image_title", "منشور صورة")
             # Re-host the image on the bot's public Railway endpoint when possible.
             public_media_url = await cache_publish_media(media_url) or media_url
             post_id = str(uuid.uuid4())
             posts = load_published_posts()
-            posts[post_id] = {"post_id": post_id, "owner_id": str(uid), "owner_name": p_name, "source_room_id": str(rid), "media_url": public_media_url, "type": "image", "title": description or "منشور صورة", "created_at": now_iso()}
+            posts[post_id] = {"post_id": post_id, "owner_id": str(uid), "owner_name": p_name, "source_room_id": str(rid), "media_url": public_media_url, "type": "image", "title": image_title, "created_at": now_iso()}
             save_published_posts(posts)
-            codes = await register_social_codes(post_id, uid, p_name, "image", description or "منشور صورة", rid)
+            codes = await register_social_codes(post_id, uid, p_name, "image", image_title, rid)
             published = 0
             for target_rid in await all_room_ids():
                 try:
-                    caption = message("publish.broadcast", "",
-                        publisher=p_name, description=description or "منشور صورة", source_label=source_room, code=codes["like"], room=source_room,
+                    caption = message("publish.broadcast", "🖼️ {description}\n👤 @{publisher}\n🏠 {room}\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} نص\n🚨 report@{report} سبب",
+                        publisher=p_name, description=image_title, source_label=source_room, code=codes["like"], room=source_room,
                         like=codes["like"], love=codes["love"], dislike=codes["dislike"],
                         comment=codes["comment"], report=codes["report"])
                     await room_send_media(target_rid, caption, public_media_url, m_type="image")
@@ -2972,7 +3010,8 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if vip_error:
             return vip_error
 
-    if cmd == ".sa":
+    interactive_sa = cmd == ".sa"
+    if interactive_sa:
         cmd = "تشغيل"
 
     if text.strip().lower().startswith("is@"):
@@ -3005,8 +3044,9 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if not arg: return "❌ اكتب: تشغيل اسم الأغنية"
         cd = await require_music_cooldown()
         if cd: return cd
-        await music_queue.put((rid, arg, "YouTube", uid, p_name))
-        return f"🎵 @{p_name} جاري تنفيذ طلبك…\n🔎 البحث عن: {arg}\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
+        await music_queue.put((rid, arg, "YouTube", uid, p_name, interactive_sa))
+        key = "music.interactive_request_started" if interactive_sa else "music.request_started"
+        return message(key, "🎵 @{requester_name} جاري تنفيذ طلبك من {source}\n🔎 البحث عن: {query}\n🏠 الغرفة: {room}", requester_name=p_name, source="YouTube", query=arg, room=rooms.get(rid, "الغرفة"))
 
     if cmd in ("مشاركة", "مشاركه", "share"):
         vip_error = await require_vip(uid, p_name, "مشاركة الأغاني")
@@ -3025,8 +3065,8 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             return "❌ اكتب: .تشغيل اسم الأغنية أو .تشغيل رابط Spotify"
         cd = await require_music_cooldown()
         if cd: return cd
-        await music_queue.put((rid, arg, "Spotify", uid, p_name))
-        return f"🎵 @{p_name} جاري تنفيذ طلبك من Spotify…\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
+        await music_queue.put((rid, arg, "Spotify", uid, p_name, False))
+        return message("music.request_started", "🎵 @{requester_name} جاري تنفيذ طلبك من {source}\n🔎 البحث عن: {query}\n🏠 الغرفة: {room}", requester_name=p_name, source="Spotify", query=arg, room=rooms.get(rid, "الغرفة"))
 
     if cmd in ("تيك", ".تيك", "tiktok", "tik"):
         vip_error = await require_vip(uid, p_name, "تشغيل الأغاني")
@@ -3034,8 +3074,8 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if not arg: return "❌ اكتب: تيك اسم الأغنية"
         cd = await require_music_cooldown()
         if cd: return cd
-        await music_queue.put((rid, arg, "TikTok", uid, p_name))
-        return f"🎵 @{p_name} جاري تنفيذ طلبك من TikTok…\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
+        await music_queue.put((rid, arg, "TikTok", uid, p_name, False))
+        return message("music.request_started", "🎵 @{requester_name} جاري تنفيذ طلبك من {source}\n🔎 البحث عن: {query}\n🏠 الغرفة: {room}", requester_name=p_name, source="TikTok", query=arg, room=rooms.get(rid, "الغرفة"))
 
 
 # -----------------------------------------------------------------------------
