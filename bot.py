@@ -4343,73 +4343,50 @@ async def main():
         await http.close()
 
 async def resolve_email():
-    """Resolve the bot username exactly like the web app.
+    """Resolve Giant Chat username exactly like the mobile/web app.
 
-    The web app calls the Supabase RPC lookup_auth_email with the
-    publishable key.  We use a direct HTTP request here so supabase-py
-    cannot add/overwrite an Authorization header with the non-JWT
-    publishable key.
+    The app first uses lookup_auth_email, but its guaranteed fallback is
+    <username>@giant.app. This lets accounts created by the current app
+    authenticate even when the RPC is unavailable to the bot key.
     """
-    url = str(C["supabase_url"]).rstrip("/")
-    key = str(C["supabase_key"]).strip()
-    headers = {
-        "apikey": key,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+    username = USERNAME.strip()
+    if not username:
+        raise RuntimeError("اسم المستخدم فارغ")
 
-    async with aiohttp.ClientSession() as session:
-        # 1) Same RPC used by the app.
-        try:
-            async with session.post(
-                f"{url}/rest/v1/rpc/lookup_auth_email",
-                headers=headers,
-                json={"_username": USERNAME},
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                body = await resp.text()
-                log.info("Supabase lookup_auth_email: HTTP %s", resp.status)
-                if resp.status == 200:
-                    try:
-                        data = json.loads(body)
-                    except Exception:
-                        data = body.strip().strip('"')
-                    if isinstance(data, str) and "@" in data:
-                        return data
-                    if isinstance(data, dict):
-                        for value in data.values():
-                            if isinstance(value, str) and "@" in value:
-                                return value
-                elif resp.status != 404:
-                    log.error("lookup_auth_email response: %s", body[:500])
-        except Exception as e:
-            log.error("lookup_auth_email request failed: %s", e)
+    # Same deterministic email mapping used by the app during sign-up/login.
+    normalized = re.sub(r"[^a-z0-9_]", "", username.lower())
+    if normalized:
+        default_email = f"{normalized}@giant.app"
+    else:
+        default_email = ""
 
-        # 2) Fallback to profiles, matching the old bot behavior.
-        try:
-            from urllib.parse import quote as _quote
-            endpoint = (
-                f"{url}/rest/v1/profiles"
-                f"?select=auth_email&username=eq.{_quote(USERNAME, safe='')}"
-                f"&limit=1"
-            )
-            async with session.get(
-                endpoint,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                body = await resp.text()
-                log.info("Supabase profiles lookup: HTTP %s", resp.status)
-                if resp.status == 200:
-                    rows = json.loads(body) if body else []
-                    if rows and rows[0].get("auth_email"):
-                        return rows[0]["auth_email"]
-                else:
-                    log.error("profiles lookup response: %s", body[:500])
-        except Exception as e:
-            log.error("profiles lookup failed: %s", e)
+    # Try the RPC first when available, but never make it a hard dependency.
+    try:
+        data, err = await rpc("lookup_auth_email", {"_username": username})
+        if not err and isinstance(data, str) and "@" in data:
+            log.info("تم العثور على بريد الحساب عبر lookup_auth_email")
+            return data.strip()
+    except Exception as e:
+        log.warning("lookup_auth_email failed; using app email mapping: %s", str(e)[:180])
 
-    raise RuntimeError(f"تعذر إيجاد البريد للحساب: {USERNAME}")
+    # Keep the profiles fallback for older accounts that explicitly store auth_email.
+    try:
+        rows, err = await table_select(
+            lambda: sb.table("profiles").select("auth_email").eq("username", username).limit(1).execute()
+        )
+        if not err and rows and rows[0].get("auth_email"):
+            email = str(rows[0]["auth_email"]).strip()
+            if "@" in email:
+                log.info("تم العثور على بريد الحساب من profiles")
+                return email
+    except Exception as e:
+        log.warning("profiles email lookup failed: %s", str(e)[:180])
+
+    if default_email:
+        log.info("استخدام بريد Giant Chat الافتراضي للحساب: %s@giant.app", normalized)
+        return default_email
+
+    raise RuntimeError("تعذر تحديد بريد الحساب")
 
 async def join(name):
     room = await find_room(name)
