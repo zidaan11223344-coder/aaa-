@@ -324,11 +324,9 @@ MUSIC_MAX_DURATION = int(C.get("music_max_duration_seconds", 900))
 # على Railway يفضل استخدام RAILWAY_PUBLIC_DOMAIN تلقائياً، أو ضع PUBLIC_BASE_URL يدوياً.
 # استخدم نطاق Railway الحالي أولاً حتى لا يبقى رابط قديم من Environment منسوخ من مشروع آخر.
 _RAILWAY_DOMAIN = str(os.environ.get("RAILWAY_PUBLIC_DOMAIN") or "").strip().strip("/")
-PUBLIC_BASE_URL = str(
-    (f"https://{_RAILWAY_DOMAIN}" if _RAILWAY_DOMAIN else "")
-    or os.environ.get("PUBLIC_BASE_URL")
-    or C.get("music_public_base_url")
-).rstrip("/")
+# إذا وضع المستخدم PUBLIC_BASE_URL يدويًا فهو المصدر الأول، حتى لا نستخدم نطاق Railway قديم.
+_MANUAL_PUBLIC_BASE_URL = str(os.environ.get("PUBLIC_BASE_URL") or C.get("music_public_base_url") or "").strip().rstrip("/")
+PUBLIC_BASE_URL = _MANUAL_PUBLIC_BASE_URL or (f"https://{_RAILWAY_DOMAIN}" if _RAILWAY_DOMAIN else "")
 MEDIA_PATH = "/media"
 MEDIA_SERVER_PORT = int(os.environ.get("PORT", "8080"))
 
@@ -941,7 +939,7 @@ GIFT_BUCKET = str(C.get("gift_image_bucket", "bot-gifts")).strip()
 
 # تخزين الوسائط الدائمة: روابط googlevideo مؤقتة لا تُرسل إلى التطبيق.
 MUSIC_BUCKET = str(C.get("music_bucket", "bot-music")).strip()
-MUSIC_STORAGE = str(C.get("music_storage", "supabase")).strip().lower()
+MUSIC_STORAGE = str(os.environ.get("MUSIC_STORAGE") or C.get("music_storage", "railway")).strip().lower()
 MUSIC_LOCAL_DIR = BASE_DIR / str(C.get("music_local_dir", "generated_music"))
 MUSIC_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 MUSIC_PUBLIC_BASE_URL = str(C.get("music_public_base_url", "")).rstrip("/")
@@ -1795,6 +1793,7 @@ async def start_media_server():
     media_dir.mkdir(parents=True, exist_ok=True)
 
     async def media_handler(request):
+        # دعم GET وHEAD وRange حتى يعمل مشغل HTML5 في تطبيق Giant Chat.
         name = os.path.basename(request.match_info.get("name", ""))
         if not name or name != request.match_info.get("name", ""):
             raise web.HTTPBadRequest(text="invalid media name")
@@ -1805,12 +1804,14 @@ async def start_media_server():
             ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
             ".webm": "audio/webm", ".ogg": "audio/ogg", ".wav": "audio/wav",
         }.get(path.suffix.lower(), "application/octet-stream")
-        return web.FileResponse(path, headers={
+        headers = {
             "Content-Type": ctype,
             "Accept-Ranges": "bytes",
             "Cache-Control": "public, max-age=86400",
             "Access-Control-Allow-Origin": "*",
-        })
+            "Access-Control-Expose-Headers": "Accept-Ranges, Content-Length, Content-Range",
+        }
+        return web.FileResponse(path, headers=headers)
 
     app.router.add_get(f"{MEDIA_PATH}/{{name}}", media_handler)
 
