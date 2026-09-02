@@ -333,36 +333,19 @@ MEDIA_PATH = "/media"
 MEDIA_SERVER_PORT = int(os.environ.get("PORT", "8080"))
 
 def create_supabase_client(url, key):
-    """Create a Supabase client compatible with sb_publishable_ keys.
+    """إنشاء عميل يدعم مفاتيح Supabase الجديدة sb_publishable_.
 
-    The mobile app uses the publishable key as the `apikey` header. Older
-    supabase-py/postgrest-py versions may copy headers during construction,
-    so updating only client.options.headers can leave PostgREST using the
-    placeholder JWT and returning HTTP 401.
+    supabase-py 2.15 يتحقق محليًا من أن المفتاح JWT، بينما publishable
+    ليس JWT. نستخدم قيمة JWT شكلية فقط لتجاوز الفحص المحلي، ثم نستبدل
+    رأس الاتصال الحقيقي إلى apiKey بالمفتاح publishable.
     """
     if str(key).startswith("sb_publishable_"):
         placeholder_jwt = "a.b.c"
         client = create_client(url, placeholder_jwt)
         client.supabase_key = key
-
-        public_headers = {"apikey": key}
-
-        # Client-level headers.
-        try:
-            headers = client.options.headers
-            headers.update(public_headers)
-            headers.pop("Authorization", None)
-        except Exception:
-            pass
-
-        # The important part: update the already-created PostgREST session.
-        try:
-            session_headers = client.postgrest.session.headers
-            session_headers.update(public_headers)
-            session_headers.pop("Authorization", None)
-        except Exception:
-            pass
-
+        headers = client.options.headers
+        headers["apiKey"] = key
+        headers.pop("Authorization", None)
         return client
     return create_client(url, key)
 
@@ -4360,11 +4343,73 @@ async def main():
         await http.close()
 
 async def resolve_email():
-    data, _ = await rpc("lookup_auth_email", {"_username": USERNAME})
-    if isinstance(data, str) and "@" in data: return data
-    rows, _ = await table_select(lambda: sb.table("profiles").select("auth_email").eq("username", USERNAME).limit(1).execute())
-    if rows and rows[0].get("auth_email"): return rows[0]["auth_email"]
-    raise RuntimeError("تعذر إيجاد البريد")
+    """Resolve the bot username exactly like the web app.
+
+    The web app calls the Supabase RPC lookup_auth_email with the
+    publishable key.  We use a direct HTTP request here so supabase-py
+    cannot add/overwrite an Authorization header with the non-JWT
+    publishable key.
+    """
+    url = str(C["supabase_url"]).rstrip("/")
+    key = str(C["supabase_key"]).strip()
+    headers = {
+        "apikey": key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        # 1) Same RPC used by the app.
+        try:
+            async with session.post(
+                f"{url}/rest/v1/rpc/lookup_auth_email",
+                headers=headers,
+                json={"_username": USERNAME},
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                body = await resp.text()
+                log.info("Supabase lookup_auth_email: HTTP %s", resp.status)
+                if resp.status == 200:
+                    try:
+                        data = json.loads(body)
+                    except Exception:
+                        data = body.strip().strip('"')
+                    if isinstance(data, str) and "@" in data:
+                        return data
+                    if isinstance(data, dict):
+                        for value in data.values():
+                            if isinstance(value, str) and "@" in value:
+                                return value
+                elif resp.status != 404:
+                    log.error("lookup_auth_email response: %s", body[:500])
+        except Exception as e:
+            log.error("lookup_auth_email request failed: %s", e)
+
+        # 2) Fallback to profiles, matching the old bot behavior.
+        try:
+            from urllib.parse import quote as _quote
+            endpoint = (
+                f"{url}/rest/v1/profiles"
+                f"?select=auth_email&username=eq.{_quote(USERNAME, safe='')}"
+                f"&limit=1"
+            )
+            async with session.get(
+                endpoint,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                body = await resp.text()
+                log.info("Supabase profiles lookup: HTTP %s", resp.status)
+                if resp.status == 200:
+                    rows = json.loads(body) if body else []
+                    if rows and rows[0].get("auth_email"):
+                        return rows[0]["auth_email"]
+                else:
+                    log.error("profiles lookup response: %s", body[:500])
+        except Exception as e:
+            log.error("profiles lookup failed: %s", e)
+
+    raise RuntimeError(f"تعذر إيجاد البريد للحساب: {USERNAME}")
 
 async def join(name):
     room = await find_room(name)
