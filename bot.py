@@ -36,6 +36,7 @@ import shutil
 import base64
 import subprocess
 import zipfile
+import io
 from pathlib import Path
 from urllib.parse import quote
 from datetime import datetime, timezone
@@ -995,33 +996,223 @@ def fit_font(text, max_width, start_size=32, min_size=16):
         size -= 2
     return ImageFont.truetype(FONT_PATH, min_size)
 
-def render_gift_image(gift, sender_name, receiver_name):
-    if not PIL_AVAILABLE:
-        raise RuntimeError("Pillow غير مثبتة؛ لن تظهر أسماء FROM وTO داخل الصورة")
-    template = Path(__file__).resolve().parent / GIFT_TEMPLATE_FILES.get(str(gift["display_id"]), "assets/gift_template_present.webp")
-    if not template.exists():
+
+# ============================================================================
+# [صور الهدايا من الإنترنت + أمر صورة] BEGIN
+# ============================================================================
+WIKI_API_URL = "https://commons.wikimedia.org/w/api.php"
+IMAGE_SEARCH_HEADERS = {"User-Agent": "GiantChatBot/1.0 (image-search; contact=admin)"}
+IMAGE_SEARCH_LAST = {}
+
+def _gift_search_terms(gift_name):
+    """تحويل اسم الهدية إلى كلمات بحث مناسبة في Wikimedia Commons."""
+    aliases = {
+        "وردة": "rose flower",
+        "قلب": "heart love",
+        "قبلة": "kiss love",
+        "دب": "teddy bear",
+        "هدية": "gift present",
+        "كعكة": "cake",
+        "ألعاب نارية": "fireworks",
+        "برق": "lightning",
+        "تاج": "crown",
+        "أميرة": "princess",
+        "سيارة": "car",
+        "طائرة": "airplane",
+        "تنين": "dragon",
+        "سفينة فضاء": "spaceship",
+        "قصر": "castle palace",
+    }
+    name = str(gift_name or "gift").strip()
+    return aliases.get(name, name)
+
+async def search_web_image(query):
+    """يبحث عن صورة عامة من Wikimedia Commons ويعيد رابط الصورة."""
+    q = str(query or "").strip()
+    if not q:
         return None
-    image = Image.open(template).convert("RGBA")
+    terms = _gift_search_terms(q)
+    params = {
+        "action": "query", "format": "json", "generator": "search",
+        "gsrsearch": terms, "gsrnamespace": 6, "gsrlimit": 12,
+        "prop": "imageinfo", "iiprop": "url|mime|size",
+        "iiurlwidth": 900, "formatversion": 2,
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=12)
+        async with aiohttp.ClientSession(timeout=timeout, headers=IMAGE_SEARCH_HEADERS) as session:
+            async with session.get(WIKI_API_URL, params=params) as resp:
+                if resp.status != 200:
+                    return None
+                payload = await resp.json(content_type=None)
+        pages = (payload.get("query") or {}).get("pages") or []
+        candidates = []
+        for page in pages:
+            info = (page.get("imageinfo") or [{}])[0]
+            url = info.get("thumburl") or info.get("url")
+            mime = str(info.get("mime") or "").lower()
+            if url and mime.startswith("image/"):
+                candidates.append(url)
+        if not candidates:
+            return None
+        key = normalize_text(q)
+        previous = IMAGE_SEARCH_LAST.get(key)
+        choices = [u for u in candidates if u != previous] or candidates
+        selected = random.choice(choices)
+        IMAGE_SEARCH_LAST[key] = selected
+        return selected
+    except Exception as exc:
+        log.warning("web image search failed query=%s: %s", q, exc)
+        return None
+
+async def download_web_image(url, prefix="web"):
+    """تنزيل صورة البحث إلى مجلد الصور المؤقتة للبوت."""
+    if not url:
+        return None
+    try:
+        outdir = GIFT_RENDER_DIR
+        outdir.mkdir(parents=True, exist_ok=True)
+        path = outdir / f"{prefix}_{uuid.uuid4().hex}.jpg"
+        timeout = aiohttp.ClientTimeout(total=18)
+        async with aiohttp.ClientSession(timeout=timeout, headers=IMAGE_SEARCH_HEADERS) as session:
+            async with session.get(url, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return None
+                raw = await resp.read()
+        if len(raw) > 12 * 1024 * 1024:
+            return None
+        if not PIL_AVAILABLE:
+            return None
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+        im.thumbnail((1400, 1400), Image.LANCZOS)
+        im.save(path, "JPEG", quality=88, optimize=True)
+        return path
+    except Exception as exc:
+        log.warning("web image download failed: %s", exc)
+        return None
+
+def _fit_crop(im, size):
+    """قص صورة إلى مقاس القالب بدون تشويه."""
+    w, h = size
+    src = im.copy().convert("RGB")
+    ratio = max(w / src.width, h / src.height)
+    nw, nh = int(src.width * ratio), int(src.height * ratio)
+    src = src.resize((nw, nh), Image.LANCZOS)
+    left, top = (nw - w) // 2, (nh - h) // 2
+    return src.crop((left, top, left + w, top + h)).convert("RGBA")
+
+def _overlay_template_foreground(canvas, template):
+    """إبقاء الزخارف المضيئة والإطار من القالب مع إظهار صورة الإنترنت خلفها."""
+    tpl = template.convert("RGBA")
+    px = tpl.load()
+    alpha = Image.new("L", tpl.size, 0)
+    ap = alpha.load()
+    for y in range(tpl.height):
+        for x in range(tpl.width):
+            r, g, b, _ = px[x, y]
+            # الخلفية الداكنة للقالب تصبح شفافة، أما الإطار والزخارف المضيئة فتبقى.
+            brightness = max(r, g, b)
+            saturation = max(r, g, b) - min(r, g, b)
+            ap[x, y] = max(0, min(255, int((brightness - 28) * 1.7 + saturation * 0.35)))
+    tpl.putalpha(alpha)
+    canvas.alpha_composite(tpl)
+    return canvas
+
+def render_gift_image(gift, sender_name, receiver_name, background_path=None):
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow غير مثبتة")
+    template_path = Path(__file__).resolve().parent / GIFT_TEMPLATE_FILES.get(
+        str(gift["display_id"]), "assets/gift_template_present.webp"
+    )
+    template = Image.open(template_path).convert("RGBA")
+    width, height = template.size
+
+    # صورة مختلفة من الإنترنت في كل إرسال، ثم قالب الهدية فوقها.
+    if background_path and Path(background_path).is_file():
+        try:
+            bg = Image.open(background_path)
+            image = _fit_crop(bg, (width, height))
+        except Exception:
+            image = Image.new("RGBA", (width, height), (18, 20, 35, 255))
+    else:
+        image = Image.new("RGBA", (width, height), (18, 20, 35, 255))
+    image = _overlay_template_foreground(image, template)
+
     draw = ImageDraw.Draw(image)
-    width, height = image.size
-    # خانتا FROM وTO في الجزء السفلي من القالب؛ يمكن تخصيصهما من config.json.
-    from_y = int(float(C.get("gift_from_y", height * 0.78)))
-    to_y = int(float(C.get("gift_to_y", height * 0.88)))
+    # المستطيلان ثابتان في مكانهما، لكن لونهما شفاف قليلاً حتى تظهر لمسة من الخلفية.
     box_left = int(float(C.get("gift_box_left", width * 0.12)))
     box_right = int(float(C.get("gift_box_right", width * 0.88)))
-    max_width = max(100, box_right - box_left - 24)
-    line_color = tuple(C.get("gift_text_color", [255, 255, 255]))
-    shadow = (0, 0, 0, 180)
-    for label, name, y in (("FROM:", sender_name, from_y), ("TO:", receiver_name, to_y)):
-        text = shape_text(f"{label} @{name}")
+    from_y = int(float(C.get("gift_from_y", height * 0.78)))
+    to_y = int(float(C.get("gift_to_y", height * 0.88)))
+    box_h = int(C.get("gift_box_height", 68))
+    draw.rounded_rectangle((box_left, from_y - 8, box_right, from_y + box_h),
+                           radius=22, fill=(5, 13, 31, 225), outline=(230, 177, 65, 230), width=3)
+    draw.rounded_rectangle((box_left, to_y - 8, box_right, to_y + box_h),
+                           radius=22, fill=(5, 13, 31, 225), outline=(230, 177, 65, 230), width=3)
+
+    max_width = max(100, box_right - box_left - 30)
+    colors = [
+        (255, 92, 155), (80, 220, 255), (255, 211, 72),
+        (157, 116, 255), (80, 235, 150), (255, 125, 70),
+    ]
+    # لون مستقل ويتغير عشوائياً في كل صورة.
+    sender_color, receiver_color = random.sample(colors, 2)
+    for label, name, y, color in (
+        ("المرسل", sender_name, from_y, sender_color),
+        ("المستقبل", receiver_name, to_y, receiver_color),
+    ):
+        text = shape_text(f"{label}: @{name}")
         font = fit_font(text, max_width)
         bbox = draw.textbbox((0, 0), text, font=font, stroke_width=1)
         x = (width - (bbox[2] - bbox[0])) // 2
-        draw.text((x + 2, y + 2), text, font=font, fill=shadow, stroke_width=2, stroke_fill=shadow)
-        draw.text((x, y), text, font=font, fill=line_color, stroke_width=1, stroke_fill=(20, 20, 20, 220))
+        draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0, 230),
+                  stroke_width=3, stroke_fill=(0, 0, 0, 230))
+        draw.text((x, y), text, font=font, fill=color,
+                  stroke_width=1, stroke_fill=(255, 255, 255, 170))
+
     path = GIFT_RENDER_DIR / f"gift_{gift['display_id']}_{uuid.uuid4().hex}.png"
     image.save(path, "PNG", optimize=True)
     return path
+
+async def make_web_gift_image(gift, sender_name, receiver_name):
+    """اختيار صورة عشوائية من الإنترنت ثم تركيب قالب الهدية والأسماء."""
+    query = _gift_search_terms(gift.get("name") or "gift")
+    for _ in range(3):
+        url = await search_web_image(query)
+        bg = await download_web_image(url, "giftbg") if url else None
+        if bg:
+            try:
+                return await asyncio.to_thread(
+                    render_gift_image, gift, sender_name, receiver_name, bg
+                )
+            finally:
+                try: bg.unlink(missing_ok=True)
+                except Exception: pass
+    # في حال تعذر الإنترنت، لا نوقف إرسال الهدية.
+    return await asyncio.to_thread(render_gift_image, gift, sender_name, receiver_name, None)
+
+async def send_image_search_command(rid, query):
+    """أمر: صورة <اسم> — يبحث عن صورة عشوائية ويرسلها في الغرفة."""
+    query = str(query or "").strip()
+    if not query:
+        return "❌ اكتب مثلاً: صورة قلب"
+    for _ in range(3):
+        url = await search_web_image(query)
+        path = await download_web_image(url, "roomimg") if url else None
+        if path:
+            try:
+                public_url = await _store_media(path, "publish", "image/jpeg")
+                await room_send_media(rid, f"🖼️ صورة: {query}", public_url, m_type="image")
+                return None
+            finally:
+                try: path.unlink(missing_ok=True)
+                except Exception: pass
+    return f"❌ لم أجد صورة مناسبة لـ «{query}» حالياً."
+
+# ============================================================================
+# [صور الهدايا من الإنترنت + أمر صورة] END
+# ============================================================================
+
 
 def publish_gift_image(local_path):
     """حفظ صورة الهدية وإرجاع رابط عام من Railway."""
@@ -1040,7 +1231,7 @@ def publish_gift_image(local_path):
 
     # حذف الصور الأقدم من 30 دقيقة لتقليل مساحة التخزين المحلي.
     now = time.time()
-    for old_file in render_dir.glob("gift_*.png"):
+    for old_file in list(render_dir.glob("gift_*.png")) + list(render_dir.glob("giftbg_*.jpg")) + list(render_dir.glob("roomimg_*.jpg")):
         try:
             if now - old_file.stat().st_mtime > 1800:
                 old_file.unlink()
@@ -1142,7 +1333,7 @@ async def send_gift_command(rid, sender_uid, sender_name, raw_text):
     image_url = None
     # لا نرسل القالب الثابت هنا؛ المطلوب صورة تحمل اسمي FROM وTO.
     try:
-        rendered = await asyncio.to_thread(render_gift_image, gift, sender_name, receiver_name)
+        rendered = await make_web_gift_image(gift, sender_name, receiver_name)
         if not rendered:
             raise RuntimeError("Pillow غير مثبتة أو تعذر إنشاء الصورة الديناميكية")
         image_url = await asyncio.to_thread(publish_gift_image, rendered)
@@ -2890,6 +3081,11 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if not await is_master(uid, p_name): return "🚫 للماستر فقط."
         data = load_welcome(); data.setdefault(str(rid), {"enabled": False, "messages": []})["enabled"] = False; save_welcome(data)
         return "⛔ تم تعطيل رسائل الترحيب."
+
+    # ---------------- البحث عن الصور من الإنترنت ----------------
+    if lower_text.startswith("صورة ") or lower_text.startswith("صور "):
+        query = text.strip().split(None, 1)[1].strip() if len(text.strip().split(None, 1)) > 1 else ""
+        return await send_image_search_command(rid, query)
 
     if text.strip().lower() in ("العاب", "ألعاب", "games", "gamehelp"):
         return HELP_GAMES
