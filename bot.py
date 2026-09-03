@@ -294,19 +294,24 @@ def yt_base_options(source_label="YouTube", cookie_file=None):
         },
     }
     if source_label == "YouTube":
-        # YouTube في 2026 يفرض PO Tokens على بعض عملاء GVS.
-        # لا نستخدم mweb افتراضياً لأنه أكثر عرضة لـ403 بدون PO Token.
-        clients = "default"
-        client_list = ["default"]
+        # احترم YOUTUBE_PLAYER_CLIENTS من Railway بدل إجبار كل الطلبات على default.
+        raw_clients = os.environ.get("YOUTUBE_PLAYER_CLIENTS") or C.get(
+            "youtube_player_clients", "default,web_embedded"
+        )
+        client_list = [x.strip() for x in str(raw_clients).split(",") if x.strip()]
+        if not client_list:
+            client_list = ["default"]
         if cookie_file and os.path.isfile(cookie_file):
             options["cookiefile"] = cookie_file
         elif has_youtube_cookies():
-            options["cookiefile"] = get_youtube_cookie_files()[0]
-        ex = {"youtube": {"player_client": client_list}}
+            files = get_youtube_cookie_files()
+            if files:
+                options["cookiefile"] = files[0]
+        ex_youtube = {"player_client": client_list}
         if YOUTUBE_PO_TOKEN:
-            # الصيغة التي يفهمها yt-dlp: client.gvs+TOKEN أو client.player+TOKEN.
-            ex["youtube"]["po_token"] = YOUTUBE_PO_TOKEN
-        options["extractor_args"] = ex
+            # لا تفقد PO token عندما يتم تغيير client من مكان آخر في الكود.
+            ex_youtube["po_token"] = YOUTUBE_PO_TOKEN
+        options["extractor_args"] = {"youtube": ex_youtube}
     elif source_label == "TikTok" and os.path.isfile(TIKTOK_COOKIES_PATH):
         options["cookiefile"] = TIKTOK_COOKIES_PATH
     return options
@@ -1107,7 +1112,11 @@ async def send_gift_command(rid, sender_uid, sender_name, raw_text):
         points, sender_data = get_user_data(sender_uid, sender_name)
         balance = int(sender_data.get("points", 0) or 0)
         if balance < cost:
-            return f"❌ نقاطك غير كافية. رصيدك: {balance} | سعر الهدية: {cost} نقطة."
+            return message(
+                "gifts.insufficient",
+                "❌ نقاطك غير كافية. رصيدك: {balance} | سعر الهدية: {cost} نقطة.",
+                balance=balance, cost=cost,
+            )
         sender_data["points"] = balance - cost
         points[sender_uid] = sender_data
         save_points(points)
@@ -1129,25 +1138,50 @@ async def send_gift_command(rid, sender_uid, sender_name, raw_text):
     # أرسل الصورة الديناميكية فقط عندما تنجح، حتى لا تظهر خانات FROM وTO فارغة.
     if image_url:
         await room_send_media(rid, f"{gift['emoji']} {gift['name']}", image_url, m_type="image")
-    await room_send(rid, f"🎁 أرسل @{sender_name} إلى @{receiver_name} هدية {gift['name']} {gift['emoji']}")
-    card = (
-        f"{gift['emoji']} 🎁 {gift['name']}\n"
-        f"👤 المرسل: @{sender_name}\n"
-        f"🎯 المستقبل: @{receiver_name}\n"
-        f"💰 القيمة: {gift['cost_points']} نقطة\n"
-        f"💳 رصيدك المتبقي: {remaining_points} نقطة"
+    # جميع رسائل الهدية قابلة للتعديل من messages.json.
+    room_sent = message(
+        "gifts.room_sent",
+        "🎁 أرسل @{sender} إلى @{receiver} هدية {gift_name} {emoji}",
+        sender=sender_name, receiver=receiver_name,
+        gift_name=gift["name"], emoji=gift["emoji"],
+    )
+    await room_send(rid, room_sent)
+    card = message(
+        "gifts.room_card",
+        "{emoji} 🎁 {gift_name}\\n📤 المرسل: @{sender}\\n📥 المستلم: @{receiver}\\n💰 القيمة: {cost} نقطة\\n💳 رصيد المرسل المتبقي: {balance} نقطة",
+        emoji=gift["emoji"], gift_name=gift["name"], sender=sender_name,
+        receiver=receiver_name, cost=gift["cost_points"], balance=remaining_points,
     )
     await room_send(rid, card)
-    # إشعارات خاصة للطرفين: لا تبقى معلومات الهدية داخل الغرفة فقط.
+
+    # إشعارات الخاص أيضًا من messages.json.
     try:
-        await dm_send(receiver_rows[0]["id"], f"🎁 @{sender_name} أرسل لك {gift['emoji']} {gift['name']} بقيمة {gift['cost_points']} نقطة.")
-        await dm_send(sender_uid, f"✅ تم إرسال {gift['emoji']} {gift['name']} إلى @{receiver_name} بقيمة {gift['cost_points']} نقطة.")
+        receiver_notice = message(
+            "gifts.private_receiver",
+            "🎁 @{sender} أرسل لك {emoji} {gift_name} بقيمة {cost} نقطة.",
+            sender=sender_name, emoji=gift["emoji"],
+            gift_name=gift["name"], cost=gift["cost_points"],
+        )
+        sender_notice = message(
+            "gifts.private_sender",
+            "✅ تم إرسال {emoji} {gift_name} إلى @{receiver} بقيمة {cost} نقطة.",
+            emoji=gift["emoji"], gift_name=gift["name"],
+            receiver=receiver_name, cost=gift["cost_points"],
+        )
+        await dm_send(receiver_rows[0]["id"], receiver_notice)
+        await dm_send(sender_uid, sender_notice)
     except Exception:
         log.exception("gift private notification failed")
-    # الهدية تُنفّذ مرة واحدة في الغرفة الأصلية، ثم يُنشر إعلانها وصورتها في كل غرف البوت الأخرى.
+
+    # الإعلان في الغرف الأخرى من messages.json أيضًا.
+    broadcast_caption = message(
+        "gifts.broadcast",
+        "🎁 هدية جديدة: {emoji} {gift_name}\\n📤 المرسل: @{sender}\\n📥 المستلم: @{receiver}\\n🏠 الغرفة: {room}",
+        emoji=gift["emoji"], gift_name=gift["name"], sender=sender_name,
+        receiver=receiver_name, room=rid,
+    )
     if image_url:
-        await broadcast_media(f"🎁 هدية جديدة: {gift['emoji']} {gift['name']} | @{sender_name} ➜ @{receiver_name}",
-                              image_url, m_type="image", exclude_rid=rid)
+        await broadcast_media(broadcast_caption, image_url, m_type="image", exclude_rid=rid)
     await broadcast_text(card, exclude_rid=rid)
     return None
 
@@ -1293,6 +1327,52 @@ async def telegram_find_chat_id():
             return None, "⚠️ لم أجد محادثة خاصة مع البوت. أرسل /start إلى بوت Telegram أولاً ثم أعد أمر نسخ احتياطي."
     except Exception as exc:
         return None, f"❌ تعذر تحديد محادثة Telegram: {type(exc).__name__}: {exc}"
+
+def build_environment_backup():
+    """إنشاء نسخة نصية من متغيرات تشغيل البوت فقط.
+
+    تشمل أسرار التشغيل لأن الأمر محصور بصاحب البوت في الخاص. لا نرسل
+    متغيرات Railway الداخلية مثل RAILWAY_* أو PATH/HOME وغيرها.
+    """
+    exact = {
+        "SUPABASE_URL", "SUPABASE_KEY", "GIANT_USERNAME", "GIANT_PASSWORD",
+        "OWNER_USERNAME", "TELEGRAM_BOT_TOKEN", "TELEGRAM_BACKUP_CHAT_ID",
+        "YOUTUBE_COOKIES", "YOUTUBE_COOKIES_B64", "YOUTUBE_PO_TOKEN",
+        "YOUTUBE_PLAYER_CLIENTS", "TIKTOK_COOKIES", "TIKTOK_COOKIES_B64",
+        "SPOTIFY_COOKIES", "SPOTIFY_COOKIES_B64", "PUBLIC_BASE_URL",
+        "RAILWAY_PUBLIC_DOMAIN", "MUSIC_STORAGE", "MUSIC_BUCKET",
+        "MUSIC_PUBLIC_BASE_URL", "GIFT_PUBLIC_BASE_URL", "GIFT_IMAGE_BUCKET",
+        "SOCIAL_WEBHOOK_TOKEN", "OPENAI_API_KEY", "LOCAL_AI_MODEL_URL",
+        "LOCAL_AI_MODEL", "LOCAL_AI_CTX", "LOCAL_AI_THREADS", "LOCAL_AI_MAX_TOKENS",
+        "AI_MAX_LOG_LINES", "PORT"
+    }
+    prefixes = ("YOUTUBE_", "TIKTOK_", "SPOTIFY_", "TELEGRAM_", "SUPABASE_",
+                "GIANT_", "OWNER_", "PUBLIC_", "MUSIC_", "GIFT_", "SOCIAL_",
+                "LOCAL_AI_", "AI_")
+    keys = sorted(k for k in os.environ
+                  if k in exact or k.startswith(prefixes))
+    lines = [
+        "# Giant Bot Environment Backup",
+        "# Generated: " + datetime.now(timezone.utc).isoformat(),
+        "# KEEP THIS FILE PRIVATE: it may contain passwords, tokens and cookies.",
+        "",
+    ]
+    for key in keys:
+        value = os.environ.get(key, "")
+        # .env-compatible quoting without exposing newlines ambiguously.
+        value = str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+        lines.append(f'{key}="{value}"')
+    return "\n".join(lines)
+
+async def send_environment_backup(uid):
+    """إرسال نسخة المتغيرات إلى خاص صاحب البوت على دفعات قابلة للنسخ."""
+    text = build_environment_backup()
+    max_len = 3200
+    chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [text]
+    await dm_send(uid, "🔐 نسخة متغيرات البوت\n⚠️ تحتوي هذه الرسائل على أسرار تشغيلية. احفظها في مكان آمن ولا تشاركها.")
+    for i, chunk in enumerate(chunks, 1):
+        await dm_send(uid, f"📦 متغيرات البوت ({i}/{len(chunks)})\n```env\n{chunk}\n```")
+    return f"✅ تم إرسال نسخة المتغيرات إلى خاصك في {len(chunks)} رسالة."
 
 async def telegram_backup():
     """Create a safe backup and send it using TELEGRAM_BOT_TOKEN only."""
@@ -1519,7 +1599,10 @@ async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=No
                 if not use_cookies:
                     options.pop("cookiefile", None)
                 if clients:
-                    options["extractor_args"] = {"youtube": {"player_client": clients}}
+                    yt_args = {"player_client": clients}
+                    if YOUTUBE_PO_TOKEN:
+                        yt_args["po_token"] = YOUTUBE_PO_TOKEN
+                    options["extractor_args"] = {"youtube": yt_args}
             options.update({
                 "format": fmt,
                 "outtmpl": str(temp_dir / f"{suffix}.%(ext)s"),
@@ -1541,11 +1624,24 @@ async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=No
             ]
             attempts = []
             if source_label == "YouTube":
-                # استخدام عميل YouTube واحد وحساب Cookies واحد فقط لمنع تبديل الجلسات.
                 cookie_files = get_youtube_cookie_files()
-                cookie_file = cookie_files[0] if cookie_files else None
-                for idx, fmt in enumerate(formats):
-                    attempts.append((idx, fmt, bool(cookie_file), ["default"], cookie_file, 0))
+                raw_clients = os.environ.get("YOUTUBE_PLAYER_CLIENTS") or C.get(
+                    "youtube_player_clients", "default,web_embedded"
+                )
+                clients_list = [x.strip() for x in str(raw_clients).split(",") if x.strip()]
+                if not clients_list:
+                    clients_list = ["default"]
+
+                # جرّب كل عميل مع الجلسة الحالية، ثم بدون Cookies.
+                # وإذا كانت هناك عدة جلسات في Railway، دوّر بينها بدل استخدام الأولى دائمًا.
+                account_pairs = [(cf, True) for cf in cookie_files]
+                account_pairs.append((None, False))
+                n = 0
+                for cookie_file, use_cookies in account_pairs:
+                    for client in clients_list:
+                        for idx, fmt in enumerate(formats):
+                            attempts.append((idx, fmt, use_cookies, [client], cookie_file, n))
+                    n += 1
             else:
                 attempts = [(idx, fmt, True, None, None, 0) for idx, fmt in enumerate(formats)]
             for idx, fmt, use_cookies, clients, cookie_file, account_idx in attempts:
@@ -4175,6 +4271,8 @@ async def dm_loop():
                         ok, m = await leave(arg); reply = ("✅ " if ok else "❌ ") + m
                     elif cmd in ("غرفي", "rooms"):
                         reply = "🏠 " + (", ".join(rooms.values()) if rooms else "لا توجد غرف")
+                    elif low in ("اجلب لي المتغيرات", "اجلب المتغيرات", "جلب المتغيرات", "نسخة المتغيرات", "متغيراتي", "env backup") and is_owner:
+                        reply = await send_environment_backup(sender)
                     elif low in ("نسخ احتياطي", "backup", "backup@telegram") and is_owner:
                         ok, m = await telegram_backup(); reply = m
                     elif low in ("master", "ماستر", "اوامر الماستر", "أوامر الماستر") and is_owner:
@@ -4183,6 +4281,7 @@ async def dm_loop():
                                  "اصلاح ذكي مشكلة — تشخيص مشكلة\n"
                                  "صمم وصف — تصميم صورة AI\n"
                                  "اضف لعبة اسم | وصف — إنشاء لعبة وصورتها\n"
+                                 "اجلب لي المتغيرات — إرسال نسخة متغيرات التشغيل في الخاص\n"
                                  "نسخ احتياطي — رفع نسخة آمنة إلى Telegram\n"
                                  "تشغيل التوثيق / إيقاف التوثيق / حالة التوثيق\n"
                                  "اضف لعبة اسم | وصف — وضع اللعبة في testing\n"
