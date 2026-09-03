@@ -1102,18 +1102,30 @@ def _fit_crop(im, size):
     return src.crop((left, top, left + w, top + h)).convert("RGBA")
 
 def _overlay_template_foreground(canvas, template):
-    """إبقاء الزخارف المضيئة والإطار من القالب مع إظهار صورة الإنترنت خلفها."""
+    """
+    يضع فوق صورة الإنترنت **الإطار والمستطيلين فقط**.
+    القوالب القديمة تحتوي رسمة هدية كاملة في المنتصف، لذلك لا نستخدم
+    شفافية مبنية على سطوع البكسل؛ تلك الطريقة كانت تُبقي الرسمة القديمة
+    ظاهرة فوق صورة الإنترنت.
+    """
     tpl = template.convert("RGBA")
-    px = tpl.load()
-    alpha = Image.new("L", tpl.size, 0)
-    ap = alpha.load()
-    for y in range(tpl.height):
-        for x in range(tpl.width):
-            r, g, b, _ = px[x, y]
-            # الخلفية الداكنة للقالب تصبح شفافة، أما الإطار والزخارف المضيئة فتبقى.
-            brightness = max(r, g, b)
-            saturation = max(r, g, b) - min(r, g, b)
-            ap[x, y] = max(0, min(255, int((brightness - 28) * 1.7 + saturation * 0.35)))
+    w, h = tpl.size
+    alpha = Image.new("L", (w, h), 0)
+    mask = ImageDraw.Draw(alpha)
+
+    # الإطار الخارجي فقط (مع الحواف والزوايا)، بدون محتوى الوسط.
+    border = 34
+    mask.rectangle((0, 0, w - 1, border), fill=255)
+    mask.rectangle((0, h - border, w - 1, h - 1), fill=255)
+    mask.rectangle((0, 0, border, h - 1), fill=255)
+    mask.rectangle((w - border, 0, w - 1, h - 1), fill=255)
+
+    # المستطيلان كما هما في القالب، مع زخارف حدودهما وداخلية داكنة
+    # حتى يبقى الاسم واضحاً فوق صورة الخلفية.
+    mask.rectangle((88, 536, 712, 641), fill=255)
+    mask.rectangle((88, 645, 712, 751), fill=255)
+
+    # لا نُظهر أي شيء من قلب/ورود/فراشات/هدية القالب القديمة.
     tpl.putalpha(alpha)
     canvas.alpha_composite(tpl)
     return canvas
@@ -1157,11 +1169,12 @@ def render_gift_image(gift, sender_name, receiver_name, background_path=None):
     ]
     # لون مستقل ويتغير عشوائياً في كل صورة.
     sender_color, receiver_color = random.sample(colors, 2)
-    for label, name, y, color in (
-        ("المرسل", sender_name, from_y, sender_color),
-        ("المستقبل", receiver_name, to_y, receiver_color),
+    for name, y, color in (
+        (sender_name, from_y, sender_color),
+        (receiver_name, to_y, receiver_color),
     ):
-        text = shape_text(f"{label}: @{name}")
+        # الاسم فقط داخل المستطيل، بدون كتابة "المرسل" أو "المستقبل" وبدون تكرار اسم الهدية.
+        text = shape_text(f"@{name}")
         font = fit_font(text, max_width)
         bbox = draw.textbbox((0, 0), text, font=font, stroke_width=1)
         x = (width - (bbox[2] - bbox[0])) // 2
