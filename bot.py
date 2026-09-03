@@ -447,6 +447,23 @@ def save_json(path, data):
 
 def load_points(): return load_json(POINTS_PATH, {})
 def save_points(p): save_json(POINTS_PATH, p)
+
+def format_points(value):
+    """عرض مختصر للنقاط: 1000 -> 1k، 1500 -> 1.5k، 1,000,000 -> 1m."""
+    try:
+        n = float(value or 0)
+    except (TypeError, ValueError):
+        return str(value)
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    units = ((1_000_000_000, "b"), (1_000_000, "m"), (1_000, "k"))
+    for divisor, suffix in units:
+        if n >= divisor:
+            x = n / divisor
+            if x.is_integer():
+                return f"{sign}{int(x)}{suffix}"
+            return f"{sign}{x:.2f}".rstrip("0").rstrip(".") + suffix
+    return f"{sign}{int(n) if n.is_integer() else n:g}"
 def load_replies(): return load_json(REPLIES_PATH, {})
 def save_replies(r): save_json(REPLIES_PATH, r)
 def load_masters(): return load_json(MASTERS_PATH, [])
@@ -1074,7 +1091,7 @@ async def gift_catalog_message():
         return "📭 لا توجد هدايا متاحة حالياً."
     lines = ["🎁 كتالوج الهدايا", "━━━━━━━━━━━━━━"]
     for g in gifts:
-        lines.append(f"{g['display_id']} {g['emoji']} {g['name']} | 💰 {g['cost_points']} نقطة")
+        lines.append(f"{g['display_id']} {g['emoji']} {g['name']} | 💰 {format_points(g['cost_points'])} نقطة")
     lines.append("━━━━━━━━━━━━━━")
     lines.append("للإرسال: gv@رقم_الهدية@اسم_الحساب")
     return "\n".join(lines)
@@ -1115,7 +1132,7 @@ async def send_gift_command(rid, sender_uid, sender_name, raw_text):
             return message(
                 "gifts.insufficient",
                 "❌ نقاطك غير كافية. رصيدك: {balance} | سعر الهدية: {cost} نقطة.",
-                balance=balance, cost=cost,
+                balance=format_points(balance), cost=format_points(cost),
             )
         sender_data["points"] = balance - cost
         points[sender_uid] = sender_data
@@ -1150,7 +1167,7 @@ async def send_gift_command(rid, sender_uid, sender_name, raw_text):
         "gifts.room_card",
         "{emoji} 🎁 {gift_name}\\n📤 المرسل: @{sender}\\n📥 المستلم: @{receiver}\\n💰 القيمة: {cost} نقطة\\n💳 رصيد المرسل المتبقي: {balance} نقطة",
         emoji=gift["emoji"], gift_name=gift["name"], sender=sender_name,
-        receiver=receiver_name, cost=gift["cost_points"], balance=remaining_points,
+        receiver=receiver_name, cost=format_points(gift["cost_points"]), balance=format_points(remaining_points),
     )
     await room_send(rid, card)
 
@@ -1160,7 +1177,7 @@ async def send_gift_command(rid, sender_uid, sender_name, raw_text):
             "gifts.private_receiver",
             "🎁 @{sender} أرسل لك {emoji} {gift_name} بقيمة {cost} نقطة.",
             sender=sender_name, emoji=gift["emoji"],
-            gift_name=gift["name"], cost=gift["cost_points"],
+            gift_name=gift["name"], cost=format_points(gift["cost_points"]),
         )
         sender_notice = message(
             "gifts.private_sender",
@@ -3133,7 +3150,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         try: amount = int(arg)
         except: return "❌ اكتب: مضاربة [عدد النقاط]"
         points, user_data = get_user_data(uid, p_name)
-        if user_data["points"] < amount: return f"⚠️ نقاطك لا تكفي ({user_data['points']})"
+        if user_data["points"] < amount: return f"⚠️ نقاطك لا تكفي ({format_points(user_data['points'])})"
         game_key = f"bet_{rid}"
         game = kaf_games.get(game_key)
         if not game:
@@ -3240,7 +3257,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
 
     if cmd == "نقاطي":
         p, d = get_user_data(uid, p_name)
-        return f"👤 @{p_name} ➔ ✨ {d['points']} نقطة"
+        return f"👤 @{p_name} ➔ ✨ {format_points(d['points'])} نقطة"
 
     if cmd == "توب":
         pts = load_points()
@@ -3249,7 +3266,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         msg = "🏆 ━━━━━━ TOP 10 ━━━━━━ 🏆\n"
         emojis = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
         for i, (u, d) in enumerate(sorted_u):
-            msg += f"{emojis[i]} @{d['username']} ➔ {d['points']} ن\n"
+            msg += f"{emojis[i]} @{d['username']} ➔ {format_points(d['points'])} ن\n"
         return msg + "━━━━━━━━━━━━━━━━━━━━"
 
 
@@ -3891,7 +3908,7 @@ async def finalize_designed_game(uid,spec):
     except Exception as exc: spec["image_error"]=f"{type(exc).__name__}: {exc}"[:500]
     testing=load_testing_games(); testing[command]=spec; save_testing_games(testing); clear_game_design(uid)
     return (f"🧪 تم إنشاء اللعبة «{spec['title']}» في بيئة الاختبار.\n🎮 الأمر: {command}\n"
-            f"🎯 الفوز: {spec['win_chance']}% | 💰 الجائزة: {spec['win_points']} نقطة\n"
+            f"🎯 الفوز: {spec['win_chance']}% | 💰 الجائزة: {format_points(spec['win_points'])} نقطة\n"
             f"🖼️ الصورة: {'✅ جاهزة' if spec.get('image_url') else '⚠️ لم ترفع'}\n"
             f"➡️ تشغيل الاختبار: تشغيل اختبار@{command}\n➡️ الاعتماد بعد النجاح: اعتماد لعبة {command}")
 
