@@ -35,7 +35,7 @@
   "game_storage": "supabase",
   "game_local_dir": "generated_games",
   "social_webhook_token": "",
-  "youtube_player_clients": "default,web_embedded",
+  "youtube_player_clients": "default,web,web_embedded",
   "vip_required_for_music": true,
   "vip_required_for_games": true,
   "vip_required_for_publish": true,

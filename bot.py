@@ -365,7 +365,7 @@ kaf_games = {}
 war_games = {}       # حرب عالمية واحدة: لاعبان من أي غرفتين
 GLOBAL_WAR_KEY = "__global_war__"  # مفتاح ثابت لمباراة حرب واحدة مشتركة بين جميع الغرف
 last_music_started = 0.0
-music_queue = asyncio.Queue()      # room_id, query, source, requester_id, requester_name
+music_queue = asyncio.Queue()      # room_id, query, source, requester_id, requester_name, broadcast_all
 music_state = {}     # room_id -> آخر أغنية شغّلها البوت
 music_last_by_user = {}  # user_id -> آخر طلب أغنية، فاصل مستقل دقيقتان لكل مستخدم
 music_tasks = {}      # room_id -> مهمة البحث/التشغيل الخلفية
@@ -941,22 +941,9 @@ async def get_gifts_catalog():
 
 
 GIFT_ASSET_BASE = "https://files.manuscdn.com/user_upload_by_module/session_file/310519663845522163/"
-GIFT_TEMPLATE_FILES = {
-    "1": "assets/gift_template_rose.webp",
-    "2": "assets/gift_template_heart.webp",
-    "3": "assets/gift_template_kiss.webp",
-    "4": "assets/gift_template_present.webp",
-    "5": "assets/gift_template_present.webp",
-    "6": "assets/gift_template_heart.webp",
-    "7": "assets/gift_template_present.webp",
-    "8": "assets/gift_template_crown.webp",
-    "9": "assets/gift_template_crown.webp",
-    "10": "assets/gift_template_present.webp",
-    "11": "assets/gift_template_present.webp",
-    "12": "assets/gift_template_crown.webp",
-    "13": "assets/gift_template_crown.webp",
-    "14": "assets/gift_template_crown.webp",
-}
+# قالب موحّد أنيق لكل الهدايا؛ محتواه الداخلي شفاف، لذلك لا تظهر صورة
+# هدية قديمة فوق الصورة التي يتم البحث عنها من الإنترنت.
+GIFT_TEMPLATE_FILES = {"default": "assets/gift_template_elegant.png"}
 BASE_DIR = Path(__file__).resolve().parent
 GIFT_BUCKET = str(C.get("gift_image_bucket", "bot-gifts")).strip()
 
@@ -1004,66 +991,97 @@ WIKI_API_URL = "https://commons.wikimedia.org/w/api.php"
 IMAGE_SEARCH_HEADERS = {"User-Agent": "GiantChatBot/1.0 (image-search; contact=admin)"}
 IMAGE_SEARCH_LAST = {}
 
+def _normalize_gift_key(value):
+    """توحيد اسم الهدية العربي قبل اختيار كلمات البحث."""
+    text = normalize_text(str(value or "").strip())
+    text = text.replace("ة", "ه").replace("ى", "ي")
+    return text
+
+GIFT_SEARCH_ALIASES = {
+    "ورده": ["rose flower", "red rose", "romantic rose"],
+    "قلب": ["red heart", "heart love", "romantic heart"],
+    "قبله": ["red lips kiss", "romantic kiss lips", "kiss lips"],
+    "بوسه": ["red lips kiss", "romantic kiss lips", "kiss lips"],
+    "دب": ["cute teddy bear", "teddy bear plush", "cute bear"],
+    "كعكه": ["birthday cake", "beautiful cake", "cake dessert"],
+    "العاب ناريه": ["colorful fireworks night", "fireworks sky", "beautiful fireworks"],
+    "برق": ["lightning bolt sky", "lightning storm sky"],
+    "تاج": ["golden crown", "royal crown", "beautiful crown"],
+    "اميره": ["princess crown", "fairy princess illustration", "princess theme"],
+    "سياره": ["luxury sports car", "red sports car", "beautiful sports car"],
+    "طائره": ["airplane sky", "passenger airplane", "beautiful airplane"],
+    "تنين": ["friendly dragon illustration", "fantasy dragon", "cute dragon"],
+    "سفينه فضاء": ["spacecraft", "rocket spaceship", "beautiful spaceship"],
+    "قصر": ["fairy tale castle", "beautiful palace castle", "royal castle"],
+}
+
+GIFT_BAD_IMAGE_WORDS = (
+    "horror", "scary", "creepy", "gore", "blood", "dead", "death", "skull",
+    "corpse", "skeleton", "war", "weapon", "gun", "knife", "violent", "accident",
+)
+
 def _gift_search_terms(gift_name):
-    """تحويل اسم الهدية إلى كلمات بحث مناسبة في Wikimedia Commons."""
-    aliases = {
-        "وردة": "rose flower",
-        "قلب": "heart love",
-        "قبلة": "kiss love",
-        "دب": "teddy bear",
-        "هدية": "gift present",
-        "كعكة": "cake",
-        "ألعاب نارية": "fireworks",
-        "برق": "lightning",
-        "تاج": "crown",
-        "أميرة": "princess",
-        "سيارة": "car",
-        "طائرة": "airplane",
-        "تنين": "dragon",
-        "سفينة فضاء": "spaceship",
-        "قصر": "castle palace",
-    }
-    name = str(gift_name or "gift").strip()
-    return aliases.get(name, name)
+    key = _normalize_gift_key(gift_name)
+    return GIFT_SEARCH_ALIASES.get(key, [str(gift_name or "gift").strip()])
 
 async def search_web_image(query):
-    """يبحث عن صورة عامة من Wikimedia Commons ويعيد رابط الصورة."""
+    """البحث عن صورة مناسبة للهدية من Wikimedia Commons مع استبعاد النتائج المخيفة."""
     q = str(query or "").strip()
     if not q:
         return None
-    terms = _gift_search_terms(q)
-    params = {
-        "action": "query", "format": "json", "generator": "search",
-        "gsrsearch": terms, "gsrnamespace": 6, "gsrlimit": 12,
-        "prop": "imageinfo", "iiprop": "url|mime|size",
-        "iiurlwidth": 900, "formatversion": 2,
-    }
-    try:
-        timeout = aiohttp.ClientTimeout(total=12)
-        async with aiohttp.ClientSession(timeout=timeout, headers=IMAGE_SEARCH_HEADERS) as session:
-            async with session.get(WIKI_API_URL, params=params) as resp:
-                if resp.status != 200:
-                    return None
-                payload = await resp.json(content_type=None)
-        pages = (payload.get("query") or {}).get("pages") or []
-        candidates = []
-        for page in pages:
-            info = (page.get("imageinfo") or [{}])[0]
-            url = info.get("thumburl") or info.get("url")
-            mime = str(info.get("mime") or "").lower()
-            if url and mime.startswith("image/"):
-                candidates.append(url)
-        if not candidates:
-            return None
-        key = normalize_text(q)
-        previous = IMAGE_SEARCH_LAST.get(key)
-        choices = [u for u in candidates if u != previous] or candidates
-        selected = random.choice(choices)
-        IMAGE_SEARCH_LAST[key] = selected
-        return selected
-    except Exception as exc:
-        log.warning("web image search failed query=%s: %s", q, exc)
-        return None
+    terms_list = _gift_search_terms(q)
+    # إذا كان الاسم معروفاً نجرّب أكثر من وصف دقيق بدلاً من البحث العربي العام.
+    for terms in terms_list[:3]:
+        params = {
+            "action": "query", "format": "json", "generator": "search",
+            "gsrsearch": terms, "gsrnamespace": 6, "gsrlimit": 30,
+            "prop": "imageinfo", "iiprop": "url|mime|size",
+            "iiurlwidth": 1000, "formatversion": 2,
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout, headers=IMAGE_SEARCH_HEADERS) as session:
+                async with session.get(WIKI_API_URL, params=params) as resp:
+                    if resp.status != 200:
+                        continue
+                    payload = await resp.json(content_type=None)
+            pages = (payload.get("query") or {}).get("pages") or []
+            candidates = []
+            wanted = set(re.findall(r"[a-z]+", terms.lower()))
+            for page in pages:
+                title = str(page.get("title") or "")
+                title_low = title.lower()
+                if any(bad in title_low for bad in GIFT_BAD_IMAGE_WORDS):
+                    continue
+                info = (page.get("imageinfo") or [{}])[0]
+                url = info.get("thumburl") or info.get("url")
+                mime = str(info.get("mime") or "").lower()
+                width = int(info.get("width") or 0)
+                height = int(info.get("height") or 0)
+                if not url or not mime.startswith("image/"):
+                    continue
+                if width and height and (width < 250 or height < 250):
+                    continue
+                title_words = set(re.findall(r"[a-z]+", title_low))
+                score = len(wanted & title_words)
+                # نرفع أولوية الصور التي تحتوي كلمات وصف الهدية نفسها.
+                if any(k in title_low for k in ("kiss", "lips", "rose", "heart", "crown", "teddy", "cake", "firework", "lightning", "castle", "spaceship", "airplane", "car", "dragon")):
+                    score += 2
+                candidates.append((score, url, title))
+            if not candidates:
+                continue
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            top_score = candidates[0][0]
+            pool = [x for x in candidates[:12] if x[0] >= max(0, top_score - 1)]
+            key = normalize_text(q)
+            previous = IMAGE_SEARCH_LAST.get(key)
+            choices = [x for x in pool if x[1] != previous] or pool
+            selected = random.choice(choices)
+            IMAGE_SEARCH_LAST[key] = selected[1]
+            return selected[1]
+        except Exception as exc:
+            log.warning("web image search failed query=%s terms=%s: %s", q, terms, exc)
+    return None
 
 async def download_web_image(url, prefix="web"):
     """تنزيل صورة البحث إلى مجلد الصور المؤقتة للبوت."""
@@ -1073,19 +1091,21 @@ async def download_web_image(url, prefix="web"):
         outdir = GIFT_RENDER_DIR
         outdir.mkdir(parents=True, exist_ok=True)
         path = outdir / f"{prefix}_{uuid.uuid4().hex}.jpg"
-        timeout = aiohttp.ClientTimeout(total=18)
+        timeout = aiohttp.ClientTimeout(total=20)
         async with aiohttp.ClientSession(timeout=timeout, headers=IMAGE_SEARCH_HEADERS) as session:
             async with session.get(url, allow_redirects=True) as resp:
                 if resp.status != 200:
                     return None
                 raw = await resp.read()
-        if len(raw) > 12 * 1024 * 1024:
+        if len(raw) > 12 * 1024 * 1024 or len(raw) < 4096:
             return None
         if not PIL_AVAILABLE:
             return None
         im = Image.open(io.BytesIO(raw)).convert("RGB")
-        im.thumbnail((1400, 1400), Image.LANCZOS)
-        im.save(path, "JPEG", quality=88, optimize=True)
+        if im.width < 250 or im.height < 250:
+            return None
+        im.thumbnail((1600, 1600), Image.LANCZOS)
+        im.save(path, "JPEG", quality=90, optimize=True)
         return path
     except Exception as exc:
         log.warning("web image download failed: %s", exc)
@@ -1101,45 +1121,45 @@ def _fit_crop(im, size):
     left, top = (nw - w) // 2, (nh - h) // 2
     return src.crop((left, top, left + w, top + h)).convert("RGBA")
 
-def _overlay_template_foreground(canvas, template):
-    """
-    يضع فوق صورة الإنترنت **الإطار والمستطيلين فقط**.
-    القوالب القديمة تحتوي رسمة هدية كاملة في المنتصف، لذلك لا نستخدم
-    شفافية مبنية على سطوع البكسل؛ تلك الطريقة كانت تُبقي الرسمة القديمة
-    ظاهرة فوق صورة الإنترنت.
-    """
-    tpl = template.convert("RGBA")
-    w, h = tpl.size
-    alpha = Image.new("L", (w, h), 0)
-    mask = ImageDraw.Draw(alpha)
+def shape_text(value):
+    text = str(value or "")
+    if arabic_reshaper and get_display and any("\u0600" <= ch <= "\u06ff" for ch in text):
+        try:
+            return get_display(arabic_reshaper.reshape(text))
+        except Exception:
+            pass
+    return text
 
-    # الإطار الخارجي فقط (مع الحواف والزوايا)، بدون محتوى الوسط.
-    border = 34
-    mask.rectangle((0, 0, w - 1, border), fill=255)
-    mask.rectangle((0, h - border, w - 1, h - 1), fill=255)
-    mask.rectangle((0, 0, border, h - 1), fill=255)
-    mask.rectangle((w - border, 0, w - 1, h - 1), fill=255)
-
-    # المستطيلان كما هما في القالب، مع زخارف حدودهما وداخلية داكنة
-    # حتى يبقى الاسم واضحاً فوق صورة الخلفية.
-    mask.rectangle((88, 536, 712, 641), fill=255)
-    mask.rectangle((88, 645, 712, 751), fill=255)
-
-    # لا نُظهر أي شيء من قلب/ورود/فراشات/هدية القالب القديمة.
-    tpl.putalpha(alpha)
-    canvas.alpha_composite(tpl)
-    return canvas
-
-def render_gift_image(gift, sender_name, receiver_name, background_path=None):
+def fit_font(text, max_width, start_size=42, min_size=18):
     if not PIL_AVAILABLE:
         raise RuntimeError("Pillow غير مثبتة")
-    template_path = Path(__file__).resolve().parent / GIFT_TEMPLATE_FILES.get(
-        str(gift["display_id"]), "assets/gift_template_present.webp"
-    )
+    size = start_size
+    while size >= min_size:
+        font = ImageFont.truetype(FONT_PATH, size)
+        bbox = font.getbbox(text)
+        if (bbox[2] - bbox[0]) <= max_width:
+            return font
+        size -= 2
+    return ImageFont.truetype(FONT_PATH, min_size)
+
+def _draw_centered_text(draw, xy, text, font, fill, stroke_fill=None, stroke_width=0):
+    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    x = int(xy[0] - tw / 2 - bbox[0])
+    y = int(xy[1] - th / 2 - bbox[1])
+    draw.text((x, y), text, font=font, fill=fill,
+              stroke_width=stroke_width, stroke_fill=stroke_fill)
+    return x, y
+
+def render_gift_image(gift, sender_name, receiver_name, background_path=None):
+    """قالب هدية ثابت أنيق + صورة إنترنت مناسبة + أسماء عربية صحيحة."""
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow غير مثبتة")
+    template_path = Path(__file__).resolve().parent / GIFT_TEMPLATE_FILES["default"]
     template = Image.open(template_path).convert("RGBA")
     width, height = template.size
 
-    # صورة مختلفة من الإنترنت في كل إرسال، ثم قالب الهدية فوقها.
     if background_path and Path(background_path).is_file():
         try:
             bg = Image.open(background_path)
@@ -1148,50 +1168,61 @@ def render_gift_image(gift, sender_name, receiver_name, background_path=None):
             image = Image.new("RGBA", (width, height), (18, 20, 35, 255))
     else:
         image = Image.new("RGBA", (width, height), (18, 20, 35, 255))
-    image = _overlay_template_foreground(image, template)
 
+    # القالب يحتوي الإطار فقط؛ لذلك لا يمكن أن تتسرب صورة/هدية قديمة إلى الوسط.
+    image.alpha_composite(template)
     draw = ImageDraw.Draw(image)
-    # المستطيلان ثابتان في مكانهما، لكن لونهما شفاف قليلاً حتى تظهر لمسة من الخلفية.
-    box_left = int(float(C.get("gift_box_left", width * 0.12)))
-    box_right = int(float(C.get("gift_box_right", width * 0.88)))
-    from_y = int(float(C.get("gift_from_y", height * 0.78)))
-    to_y = int(float(C.get("gift_to_y", height * 0.88)))
-    box_h = int(C.get("gift_box_height", 68))
-    draw.rounded_rectangle((box_left, from_y - 8, box_right, from_y + box_h),
-                           radius=22, fill=(5, 13, 31, 225), outline=(230, 177, 65, 230), width=3)
-    draw.rounded_rectangle((box_left, to_y - 8, box_right, to_y + box_h),
-                           radius=22, fill=(5, 13, 31, 225), outline=(230, 177, 65, 230), width=3)
 
-    max_width = max(100, box_right - box_left - 30)
+    gold = (244, 196, 92, 255)
+    panel = (10, 14, 28, 238)
+
+    # عنوان الهدية ديناميكي: نفس القالب، لكن اسم كل هدية يتغير.
+    header_box = (int(width * 0.27), 65, int(width * 0.73), 205)
+    draw.rounded_rectangle(header_box, radius=48, fill=panel, outline=gold, width=4)
+    gift_title = shape_text(f"{gift.get('emoji', '🎁')}  هدية {gift.get('name', 'هدية')}  {gift.get('emoji', '🎁')}")
+    header_font = fit_font(gift_title, header_box[2] - header_box[0] - 50, 44, 24)
+    _draw_centered_text(draw, ((header_box[0] + header_box[2]) / 2, 135),
+                        gift_title, header_font, (255, 222, 155, 255),
+                        stroke_fill=(0, 0, 0, 180), stroke_width=2)
+
+    # المستطيل الأيسر = إلى / المستقبل، والأيمن = من / المرسل.
+    left = (55, int(height * 0.70), int(width * 0.455), int(height * 0.91))
+    right = (int(width * 0.545), int(height * 0.70), width - 55, int(height * 0.91))
+    for box in (left, right):
+        draw.rounded_rectangle(box, radius=34, fill=panel, outline=gold, width=4)
+
+    # عناوين صغيرة داخل المستطيلين.
+    label_font = ImageFont.truetype(FONT_PATH, 28)
+    _draw_centered_text(draw, ((left[0] + left[2]) / 2, left[1] + 35),
+                        shape_text("إلى"), label_font, (255, 224, 165, 255))
+    _draw_centered_text(draw, ((right[0] + right[2]) / 2, right[1] + 35),
+                        shape_text("من"), label_font, (255, 224, 165, 255))
+
     colors = [
-        (255, 92, 155), (80, 220, 255), (255, 211, 72),
-        (157, 116, 255), (80, 235, 150), (255, 125, 70),
+        (255, 130, 165, 255), (100, 220, 255, 255),
+        (255, 211, 85, 255), (180, 135, 255, 255),
+        (100, 235, 170, 255), (255, 150, 95, 255),
     ]
-    # لون مستقل ويتغير عشوائياً في كل صورة.
-    sender_color, receiver_color = random.sample(colors, 2)
-    for name, y, color in (
-        (sender_name, from_y, sender_color),
-        (receiver_name, to_y, receiver_color),
-    ):
-        # الاسم فقط داخل المستطيل، بدون كتابة "المرسل" أو "المستقبل" وبدون تكرار اسم الهدية.
-        text = shape_text(f"{name}")
-        font = fit_font(text, max_width)
-        bbox = draw.textbbox((0, 0), text, font=font, stroke_width=1)
-        x = (width - (bbox[2] - bbox[0])) // 2
-        draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0, 230),
-                  stroke_width=3, stroke_fill=(0, 0, 0, 230))
-        draw.text((x, y), text, font=font, fill=color,
-                  stroke_width=1, stroke_fill=(255, 255, 255, 170))
+    receiver_text = shape_text(receiver_name)
+    sender_text = shape_text(sender_name)
+    receiver_font = fit_font(receiver_text, left[2] - left[0] - 50, 46, 20)
+    sender_font = fit_font(sender_text, right[2] - right[0] - 50, 46, 20)
+    receiver_color, sender_color = random.sample(colors, 2)
+    _draw_centered_text(draw, ((left[0] + left[2]) / 2, left[1] + (left[3] - left[1]) * 0.62),
+                        receiver_text, receiver_font, receiver_color,
+                        stroke_fill=(0, 0, 0, 210), stroke_width=3)
+    _draw_centered_text(draw, ((right[0] + right[2]) / 2, right[1] + (right[3] - right[1]) * 0.62),
+                        sender_text, sender_font, sender_color,
+                        stroke_fill=(0, 0, 0, 210), stroke_width=3)
 
     path = GIFT_RENDER_DIR / f"gift_{gift['display_id']}_{uuid.uuid4().hex}.png"
     image.save(path, "PNG", optimize=True)
     return path
 
 async def make_web_gift_image(gift, sender_name, receiver_name):
-    """اختيار صورة عشوائية من الإنترنت ثم تركيب قالب الهدية والأسماء."""
-    query = _gift_search_terms(gift.get("name") or "gift")
-    for _ in range(3):
-        url = await search_web_image(query)
+    """اختيار صورة معبّرة للهدية ثم تركيبها داخل القالب الثابت."""
+    for _ in range(4):
+        url = await search_web_image(gift.get("name") or "gift")
         bg = await download_web_image(url, "giftbg") if url else None
         if bg:
             try:
@@ -1199,9 +1230,11 @@ async def make_web_gift_image(gift, sender_name, receiver_name):
                     render_gift_image, gift, sender_name, receiver_name, bg
                 )
             finally:
-                try: bg.unlink(missing_ok=True)
-                except Exception: pass
-    # في حال تعذر الإنترنت، لا نوقف إرسال الهدية.
+                try:
+                    bg.unlink(missing_ok=True)
+                except Exception:
+                    pass
+    # إذا تعذر الإنترنت نستخدم خلفية بسيطة، ولا نعرض صورة هدية خاطئة.
     return await asyncio.to_thread(render_gift_image, gift, sender_name, receiver_name, None)
 
 async def send_image_search_command(rid, query):
@@ -1595,6 +1628,34 @@ async def send_environment_backup(uid):
         await dm_send(uid, f"📦 متغيرات البوت ({i}/{len(chunks)})\n```env\n{chunk}\n```")
     return f"✅ تم إرسال نسخة المتغيرات إلى خاصك في {len(chunks)} رسالة."
 
+async def telegram_send_environment_file():
+    """إرسال كل متغيرات التشغيل في ملف .env إلى Telegram."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False, "⚠️ أضف TELEGRAM_BOT_TOKEN في Railway Variables."
+    chat_id, chat_error = await telegram_find_chat_id()
+    if not chat_id:
+        return False, chat_error
+    tmp = Path(tempfile.mkdtemp(prefix="bot_env_"))
+    env_file = tmp / "giant_bot_variables.env"
+    try:
+        env_file.write_text(build_environment_backup() + "\n", encoding="utf-8")
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        form = aiohttp.FormData()
+        form.add_field("chat_id", chat_id)
+        form.add_field("caption", "🔐 ملف متغيرات تشغيل Giant Bot\n⚠️ يحتوي على كلمات مرور وTokens وCookies؛ احفظه بشكل خاص.")
+        form.add_field("document", env_file.open("rb"),
+                       filename=env_file.name, content_type="text/plain")
+        async with http.post(url, data=form, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+            body = await resp.text()
+            if resp.status >= 400:
+                return False, f"❌ فشل إرسال ملف المتغيرات إلى Telegram: HTTP {resp.status} {body[:300]}"
+        return True, "✅ تم إرسال ملف المتغيرات إلى Telegram."
+    except Exception as exc:
+        log.exception("telegram env file failed")
+        return False, f"❌ تعذر إرسال ملف المتغيرات: {type(exc).__name__}: {exc}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
 async def telegram_backup():
     """Create a safe backup and send it using TELEGRAM_BOT_TOKEN only."""
     if not TELEGRAM_BOT_TOKEN:
@@ -1627,7 +1688,10 @@ async def telegram_backup():
             if resp.status >= 400:
                 body = await resp.text()
                 return False, f"❌ فشل رفع النسخة إلى Telegram: HTTP {resp.status} {body[:300]}"
-        return True, "✅ تم إنشاء ورفع النسخة الاحتياطية إلى Telegram."
+        env_ok, env_msg = await telegram_send_environment_file()
+        if not env_ok:
+            return True, "✅ تم رفع النسخة الاحتياطية إلى Telegram، لكن تعذر إرسال ملف المتغيرات: " + env_msg
+        return True, "✅ تم رفع النسخة الاحتياطية وملف المتغيرات إلى Telegram."
     except Exception as exc:
         log.exception("telegram backup failed")
         return False, f"❌ تعذر إنشاء النسخة الاحتياطية: {type(exc).__name__}: {exc}"
@@ -2557,7 +2621,7 @@ async def render_music_card(track, requester_name, source_room):
 
 # [الأغاني] تشغيل المسار — بداية
 
-async def play_track(rid, track, source_label, requester_id, requester_name):
+async def play_track(rid, track, source_label, requester_id, requester_name, broadcast_all=False):
     if not track:
         return False, "لم أجد المقطع المطلوب"
     source_room = rooms.get(rid, "الغرفة")
@@ -2576,8 +2640,24 @@ async def play_track(rid, track, source_label, requester_id, requester_name):
             return True, None
         return False, "تم الوصول للنتيجة لكن لم يتم إنشاء ملف صوتي ولا رابط تشغيل مباشر."
 
-    # تسجيل الأغنية كمنشور بدون إنشاء صورة للأغنية، حتى تبقى التفاعلات
-    # (إعجاب/حب/تعليق) مرتبطة بصاحب الطلب عبر post_id.
+    duration_ms = int(track.get("duration_ms") or (float(track.get("duration") or 0) * 1000))
+    if duration_ms <= 0:
+        return False, "مدة الصوت صفر؛ تم منع إرسال بصمة صوت فارغة."
+
+    if not broadcast_all:
+        # أوامر تشغيل العادية تبقى داخل الغرفة التي طلبت الأغنية فقط.
+        await room_send(rid, message(
+            "music.local",
+            "🎵 @{requester_name} — تشغيل: {title}\n🎤 {artist}\n🏠 الغرفة: {room}",
+            requester_name=requester_name, title=title, artist=artist, room=source_room,
+        ))
+        await room_send_media(
+            rid, f"▶️ تشغيل | {title}", media_url, m_type="voice",
+            duration_ms=duration_ms,
+        )
+        return True, None
+
+    # .sa فقط ينشئ منشوراً عالمياً مع كود واحد للتفاعلات.
     post_id = str(uuid.uuid4())
     posts = load_published_posts()
     posts[post_id] = {
@@ -2587,23 +2667,19 @@ async def play_track(rid, track, source_label, requester_id, requester_name):
     }
     save_published_posts(posts)
     codes = await register_social_codes(post_id, requester_id, requester_name, "music", title, rid)
-
-    # الرسالة محفوظة خارج bot.py في messages.json لتسهيل تعديلها.
-    caption = message("music.broadcast",
-        "🎵 SONG BROADCAST\n🎤 {requester_name}\n{title}\n💬 Room: {room}\n👍 lk@{code}",
+    caption = message(
+        "music.broadcast",
+        "🎵 SONG BROADCAST\n🎤 {requester_name}\n{title}\n💬 Room: {room}\n👍 lk@{code}\n❤️ lv@{code}\n👎 dl@{code}\n💬 cm@{code} msg",
         requester_name=requester_name, title=title, source_label=source_label,
-        code=codes["like"], room=source_room)
+        code=codes["like"], room=source_room,
+    )
     targets = await all_room_ids()
     for target_rid in targets:
         try:
             await room_send(target_rid, caption)
-            duration_ms = int(track.get("duration_ms") or (float(track.get("duration") or 0) * 1000))
-            if duration_ms <= 0:
-                raise RuntimeError("مدة الصوت صفر؛ تم منع إرسال بصمة صوت فارغة")
             await room_send_media(
-                target_rid,
-                f"▶️ تشغيل | {title}",
-                media_url, m_type="voice", duration_ms=duration_ms,
+                target_rid, f"▶️ تشغيل | {title}", media_url,
+                m_type="voice", duration_ms=duration_ms,
             )
         except Exception as exc:
             log.exception("music broadcast failed room=%s", target_rid)
@@ -2639,7 +2715,7 @@ async def music_worker_queue():
     interval = max(0, int(C.get("music_interval_seconds", 0)))
     while True:
         item = await music_queue.get()
-        rid, query, source, requester_id, requester_name = item
+        rid, query, source, requester_id, requester_name, broadcast_all = item
         try:
             wait = interval - (time.time() - last_music_started)
             if wait > 0:
@@ -2667,7 +2743,7 @@ async def music_worker_queue():
                 await room_send(rid, friendly_music_error(err))
                 await report_music_error_to_masters(rid, source, query, err, stage="البحث/الاتصال")
             else:
-                ok, out = await play_track(rid, track, used_source, requester_id, requester_name)
+                ok, out = await play_track(rid, track, used_source, requester_id, requester_name, broadcast_all=broadcast_all)
                 if not ok and out:
                     await room_send(rid, friendly_music_error(out))
                     await report_music_error_to_masters(rid, used_source, query, out, stage="التنزيل/التجهيز/الإرسال")
@@ -3135,8 +3211,12 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if vip_error:
             return vip_error
 
-    if cmd == ".sa":
-        cmd = "تشغيل"
+    # .sa هو الأمر الوحيد الذي ينشر الأغنية والتفاعلات في كل الغرف.
+    # الصيغة المعتمدة: .sa اسم الأغنية
+    sa_match = re.match(r"^\.sa\s+(.+)$", text.strip(), re.I | re.S)
+    broadcast_music = bool(sa_match)
+    if text.strip().lower() == ".sa":
+        return "❌ اكتب: .sa اسم الأغنية"
 
     if text.strip().lower().startswith("is@"):
         target = text.split("@", 1)[1].strip().lstrip("@")
@@ -3151,13 +3231,24 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         target = text.split("@", 1)[1].strip()
         return await share_music_to_user(uid, target, music_state.get(rid))
 
+    if broadcast_music:
+        vip_error = await require_vip(uid, p_name, "نشر الأغاني")
+        if vip_error:
+            return vip_error
+        sa_arg = sa_match.group(1).strip()
+        cd = await require_music_cooldown()
+        if cd:
+            return cd
+        await music_queue.put((rid, sa_arg, "YouTube", uid, p_name, True))
+        return f"🎵 @{p_name} — جاري نشر الأغنية في كل الغرف\n🔎 {sa_arg}"
+
     if cmd in ("تشغيل", "play", "شغل"):
         vip_error = await require_vip(uid, p_name, "تشغيل الأغاني")
         if vip_error: return vip_error
         if not arg: return "❌ اكتب: تشغيل اسم الأغنية"
         cd = await require_music_cooldown()
         if cd: return cd
-        await music_queue.put((rid, arg, "YouTube", uid, p_name))
+        await music_queue.put((rid, arg, "YouTube", uid, p_name, False))
         return f"🎵 @{p_name} جاري تنفيذ طلبك…\n🔎 البحث عن: {arg}\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
     if cmd in ("مشاركة", "مشاركه", "share"):
@@ -3177,7 +3268,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             return "❌ اكتب: .تشغيل اسم الأغنية أو .تشغيل رابط Spotify"
         cd = await require_music_cooldown()
         if cd: return cd
-        await music_queue.put((rid, arg, "Spotify", uid, p_name))
+        await music_queue.put((rid, arg, "Spotify", uid, p_name, False))
         return f"🎵 @{p_name} جاري تنفيذ طلبك من Spotify…\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
     if cmd in ("تيك", ".تيك", "tiktok", "tik"):
@@ -3186,7 +3277,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if not arg: return "❌ اكتب: تيك اسم الأغنية"
         cd = await require_music_cooldown()
         if cd: return cd
-        await music_queue.put((rid, arg, "TikTok", uid, p_name))
+        await music_queue.put((rid, arg, "TikTok", uid, p_name, False))
         return f"🎵 @{p_name} جاري تنفيذ طلبك من TikTok…\n🏠 الغرفة: {rooms.get(rid, 'الغرفة')}"
 
 
@@ -4497,8 +4588,9 @@ async def dm_loop():
                         ok, m = await leave(arg); reply = ("✅ " if ok else "❌ ") + m
                     elif cmd in ("غرفي", "rooms"):
                         reply = "🏠 " + (", ".join(rooms.values()) if rooms else "لا توجد غرف")
-                    elif low in ("اجلب لي المتغيرات", "اجلب المتغيرات", "جلب المتغيرات", "نسخة المتغيرات", "متغيراتي", "env backup") and is_owner:
-                        reply = await send_environment_backup(sender)
+                    elif low in ("اجلب لي المتغيرات", "اجلب المتغيرات", "جلب المتغيرات", "نسخة المتغيرات", "متغيراتي", "نسخ متغيرات", "نسخ المتغيرات", "متغيرات تلجرام", "متغيرات تيليجرام", "env backup") and is_owner:
+                        ok, m = await telegram_send_environment_file()
+                        reply = m
                     elif low in ("نسخ احتياطي", "backup", "backup@telegram") and is_owner:
                         ok, m = await telegram_backup(); reply = m
                     elif low in ("master", "ماستر", "اوامر الماستر", "أوامر الماستر") and is_owner:
@@ -4507,7 +4599,7 @@ async def dm_loop():
                                  "اصلاح ذكي مشكلة — تشخيص مشكلة\n"
                                  "صمم وصف — تصميم صورة AI\n"
                                  "اضف لعبة اسم | وصف — إنشاء لعبة وصورتها\n"
-                                 "اجلب لي المتغيرات — إرسال نسخة متغيرات التشغيل في الخاص\n"
+                                 "اجلب لي المتغيرات — إرسال ملف متغيرات التشغيل إلى Telegram\n"
                                  "نسخ احتياطي — رفع نسخة آمنة إلى Telegram\n"
                                  "تشغيل التوثيق / إيقاف التوثيق / حالة التوثيق\n"
                                  "اضف لعبة اسم | وصف — وضع اللعبة في testing\n"
