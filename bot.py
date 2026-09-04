@@ -1203,8 +1203,19 @@ def render_gift_image(gift, sender_name, receiver_name, background_path=None):
     """قالب هدية ثابت أنيق + صورة إنترنت مناسبة + أسماء عربية صحيحة."""
     if not PIL_AVAILABLE:
         raise RuntimeError("Pillow غير مثبتة")
-    template_path = Path(__file__).resolve().parent / GIFT_TEMPLATE_FILES["default"]
-    template = Image.open(template_path).convert("RGBA")
+    # القالب اختياري: بعض منصات النشر قد لا تنسخ ملف القالب رغم وجوده محلياً.
+    # في هذه الحالة ننشئ قالباً شفافاً تلقائياً بدلاً من فشل إرسال الهدية.
+    base_dir = Path(__file__).resolve().parent
+    template_path = base_dir / GIFT_TEMPLATE_FILES["default"]
+    if template_path.is_file():
+        try:
+            template = Image.open(template_path).convert("RGBA")
+        except Exception as exc:
+            log.warning("تعذر فتح قالب الهدية %s: %s — سيتم استخدام قالب داخلي", template_path, exc)
+            template = Image.new("RGBA", (1239, 1270), (0, 0, 0, 0))
+    else:
+        log.warning("قالب الهدية غير موجود: %s — سيتم استخدام قالب داخلي", template_path)
+        template = Image.new("RGBA", (1239, 1270), (0, 0, 0, 0))
     width, height = template.size
 
     if background_path and Path(background_path).is_file():
