@@ -944,6 +944,13 @@ GIFT_ASSET_BASE = "https://files.manuscdn.com/user_upload_by_module/session_file
 # قالب موحّد أنيق لكل الهدايا؛ محتواه الداخلي شفاف، لذلك لا تظهر صورة
 # هدية قديمة فوق الصورة التي يتم البحث عنها من الإنترنت.
 GIFT_TEMPLATE_FILES = {"default": "assets/gift_template_elegant.png"}
+# صور الهدايا المحلية الثابتة. استبدل أي ملف بنفس الاسم لتغيير الصورة.
+# ثلاث صور محلية لكل هدية. يتم اختيار صورة عشوائية عند كل إرسال.
+# يمكنك استبدال الملفات بنفس الأسماء دون تعديل bot.py.
+GIFT_LOCAL_FILES = {
+    str(i): [f"assets/gift_{i:02d}_1.png", f"assets/gift_{i:02d}_2.png", f"assets/gift_{i:02d}_3.png"]
+    for i in range(1, 15)
+}
 BASE_DIR = Path(__file__).resolve().parent
 GIFT_BUCKET = str(C.get("gift_image_bucket", "bot-gifts")).strip()
 
@@ -1005,7 +1012,7 @@ def fit_font(text, max_width, start_size=32, min_size=16):
 
 
 # ============================================================================
-# [صور الهدايا من الإنترنت + أمر صورة] BEGIN
+# [صور الهدايا المحلية + أمر صورة عام] BEGIN
 # ============================================================================
 WIKI_API_URL = "https://commons.wikimedia.org/w/api.php"
 IMAGE_SEARCH_HEADERS = {"User-Agent": "GiantChatBot/1.0 (image-search; contact=admin)"}
@@ -1228,58 +1235,106 @@ def render_gift_image(gift, sender_name, receiver_name, background_path=None):
                         gift_title, header_font, (255, 222, 155, 255),
                         stroke_fill=(0, 0, 0, 180), stroke_width=2)
 
-    # المستطيل الأيسر = إلى / المستقبل، والأيمن = من / المرسل.
-    left = (55, int(height * 0.70), int(width * 0.455), int(height * 0.91))
-    right = (int(width * 0.545), int(height * 0.70), width - 55, int(height * 0.91))
-    for box in (left, right):
-        draw.rounded_rectangle(box, radius=34, fill=panel, outline=gold, width=4)
+    # تخطيط الأسماء: مستطيل فوق مستطيل كما طلبت، مع إبقاء النص العربي والإنجليزي سليماً.
+    # نغطي منطقة الصناديق القديمة في القالب أولاً بخلفية الصورة الحالية.
+    lower_y = int(height * 0.695)
+    try:
+        image.paste(image.crop((0, lower_y, width, height)), (0, lower_y))
+    except Exception:
+        pass
 
-    # عناوين صغيرة داخل المستطيلين.
-    # عناوين "إلى" و"من" عربية: استخدم الخط العربي الحالي دون أي تغيير.
-    label_font = ImageFont.truetype(FONT_PATH, 30)
-    _draw_centered_text(draw, ((left[0] + left[2]) / 2, left[1] + 35),
-                        shape_text("إلى"), label_font, (255, 224, 165, 255))
-    _draw_centered_text(draw, ((right[0] + right[2]) / 2, right[1] + 35),
+    # إعادة رسم الجزء السفلي من الصورة الأصلية فقط لمسح خانات القالب القديمة،
+    # ثم نضع صندوقين مركزيين متساويين فوق بعضهما.
+    if background_path and Path(background_path).is_file():
+        try:
+            bg_full = Image.open(background_path).convert("RGB")
+            bg_crop = _fit_crop(bg_full, (width, height))
+            image.paste(bg_crop.crop((0, lower_y, width, height)), (0, lower_y))
+        except Exception:
+            pass
+
+    box_w = int(width * 0.64)
+    box_h = int(height * 0.105)
+    box_x = (width - box_w) // 2
+    top_y = int(height * 0.705)
+    bottom_y = int(height * 0.815)
+    top_box = (box_x, top_y, box_x + box_w, top_y + box_h)
+    bottom_box = (box_x, bottom_y, box_x + box_w, bottom_y + box_h)
+
+    for box in (top_box, bottom_box):
+        draw.rounded_rectangle(box, radius=28, fill=panel, outline=gold, width=4)
+
+    label_font = ImageFont.truetype(FONT_PATH, 27)
+    _draw_centered_text(draw, ((top_box[0] + top_box[2]) / 2, top_box[1] + 28),
                         shape_text("من"), label_font, (255, 224, 165, 255))
+    _draw_centered_text(draw, ((bottom_box[0] + bottom_box[2]) / 2, bottom_box[1] + 28),
+                        shape_text("إلى"), label_font, (255, 224, 165, 255))
 
     colors = [
         (255, 130, 165, 255), (100, 220, 255, 255),
         (255, 211, 85, 255), (180, 135, 255, 255),
         (100, 235, 170, 255), (255, 150, 95, 255),
     ]
-    receiver_text = shape_text(receiver_name)
     sender_text = shape_text(sender_name)
-    receiver_font = fit_font(receiver_text, left[2] - left[0] - 42, 42, 20)
-    sender_font = fit_font(sender_text, right[2] - right[0] - 42, 42, 20)
-    receiver_color, sender_color = random.sample(colors, 2)
-    _draw_centered_text(draw, ((left[0] + left[2]) / 2, left[1] + (left[3] - left[1]) * 0.62),
-                        receiver_text, receiver_font, receiver_color,
-                        stroke_fill=(0, 0, 0, 210), stroke_width=3)
-    _draw_centered_text(draw, ((right[0] + right[2]) / 2, right[1] + (right[3] - right[1]) * 0.62),
+    receiver_text = shape_text(receiver_name)
+    sender_font = fit_font(sender_text, box_w - 42, 39, 18)
+    receiver_font = fit_font(receiver_text, box_w - 42, 39, 18)
+    sender_color, receiver_color = random.sample(colors, 2)
+    _draw_centered_text(draw, ((top_box[0] + top_box[2]) / 2, top_box[1] + box_h * 0.68),
                         sender_text, sender_font, sender_color,
+                        stroke_fill=(0, 0, 0, 210), stroke_width=3)
+    _draw_centered_text(draw, ((bottom_box[0] + bottom_box[2]) / 2, bottom_box[1] + box_h * 0.68),
+                        receiver_text, receiver_font, receiver_color,
                         stroke_fill=(0, 0, 0, 210), stroke_width=3)
 
     path = GIFT_RENDER_DIR / f"gift_{gift['display_id']}_{uuid.uuid4().hex}.png"
     image.save(path, "PNG", optimize=True)
     return path
 
+async def download_gift_asset(url, prefix="giftasset"):
+    """وظيفة قديمة للاحتياط؛ لا تُستدعى من إرسال الهدايا المحلية."""
+    if not url:
+        return None
+    try:
+        outdir = GIFT_RENDER_DIR
+        outdir.mkdir(parents=True, exist_ok=True)
+        path = outdir / f"{prefix}_{uuid.uuid4().hex}.png"
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout, headers=IMAGE_SEARCH_HEADERS) as session:
+            async with session.get(url, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return None
+                raw = await resp.read()
+        if len(raw) > 12 * 1024 * 1024 or len(raw) < 200:
+            return None
+        if not PIL_AVAILABLE:
+            return None
+        im = Image.open(io.BytesIO(raw)).convert("RGBA")
+        if im.width < 32 or im.height < 32:
+            return None
+        # نحافظ على صورة الهدية الأصلية، مع تكبيرها بجودة جيدة إذا كانت صغيرة.
+        im.thumbnail((1600, 1600), Image.LANCZOS)
+        im.save(path, "PNG", optimize=True)
+        return path
+    except Exception as exc:
+        log.warning("gift asset download failed: %s", exc)
+        return None
+
 async def make_web_gift_image(gift, sender_name, receiver_name):
-    """اختيار صورة معبّرة للهدية ثم تركيبها داخل القالب الثابت."""
-    for _ in range(4):
-        url = await search_web_image(gift.get("name") or "gift")
-        bg = await download_web_image(url, "giftbg") if url else None
-        if bg:
-            try:
-                return await asyncio.to_thread(
-                    render_gift_image, gift, sender_name, receiver_name, bg
-                )
-            finally:
-                try:
-                    bg.unlink(missing_ok=True)
-                except Exception:
-                    pass
-    # إذا تعذر الإنترنت نستخدم خلفية بسيطة، ولا نعرض صورة هدية خاطئة.
-    return await asyncio.to_thread(render_gift_image, gift, sender_name, receiver_name, None)
+    """إنشاء بطاقة الهدية من الصور المحلية فقط، مع اختيار واحدة من 3 صور.
+    لا يتم إجراء أي بحث على الإنترنت عند إرسال الهدايا.
+    """
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow غير مثبتة")
+    gid = str(gift.get("display_id") or "")
+    candidates = GIFT_LOCAL_FILES.get(gid) or []
+    existing = [Path(__file__).resolve().parent / rel for rel in candidates]
+    existing = [p for p in existing if p.is_file()]
+    # لا fallback إلى الويب: إذا لم توجد صور محلية نوقف الإرسال بدلاً من البحث.
+    if not existing:
+        raise RuntimeError(f"لا توجد صور محلية للهدية رقم {gid}; أضف 1.png و2.png و3.png")
+    path = random.choice(existing)
+    return await asyncio.to_thread(render_gift_image, gift, sender_name, receiver_name, path)
 
 async def send_image_search_command(rid, query):
     """أمر: صورة <اسم> — يبحث عن صورة عشوائية ويرسلها في الغرفة."""
@@ -1300,7 +1355,7 @@ async def send_image_search_command(rid, query):
     return f"❌ لم أجد صورة مناسبة لـ «{query}» حالياً."
 
 # ============================================================================
-# [صور الهدايا من الإنترنت + أمر صورة] END
+# [صور الهدايا المحلية + أمر صورة عام] END
 # ============================================================================
 
 
@@ -1357,7 +1412,8 @@ def gift_view(gift):
         "name": gift.get("name") or gift.get("gift_name") or f"هدية رقم {display_id}",
         "emoji": gift.get("emoji") or "🎁",
         "cost_points": gift.get("cost_points", gift.get("cost", 0)),
-        "image_url": GIFT_ASSETS.get(display_id) or gift.get("image_url") or gift.get("image") or gift.get("media_url")
+        # صور الهدايا تُدار محلياً فقط؛ لا نعتمد على روابط البحث أو CDN.
+        "image_url": None
     }
 
 
@@ -1466,6 +1522,20 @@ async def send_gift_command(rid, sender_uid, sender_name, raw_text):
             emoji=gift["emoji"], gift_name=gift["name"],
             receiver=receiver_name, cost=gift["cost_points"],
         )
+        # أرسل صورة الهدية نفسها في الخاص، وليس إشعاراً نصياً فقط.
+        if image_url:
+            await dm_send_media(
+                receiver_rows[0]["id"],
+                f"🎁 {gift['name']} | @{sender_name} ➜ @{receiver_name}",
+                image_url,
+                m_type="image",
+            )
+            await dm_send_media(
+                sender_uid,
+                f"✅ {gift['name']} | @{sender_name} ➜ @{receiver_name}",
+                image_url,
+                m_type="image",
+            )
         await dm_send(receiver_rows[0]["id"], receiver_notice)
         await dm_send(sender_uid, sender_notice)
     except Exception:
