@@ -4189,6 +4189,28 @@ async def ai_response(prompt, max_output=2500):
         return None, f"❌ تعذر تشغيل الذكاء الاصطناعي المحلي: {type(exc).__name__}: {exc}"
 
 async def ai_diagnose(problem=""):
+    # تشخيص مشاكل الموسيقى المعروفة مباشرة بدون تشغيل نموذج الذكاء المحلي؛
+    # هذا يمنع انتظار تحميل نموذج GGUF وإرسال رسائل تقدم متكررة للماستر.
+    problem_text = normalize_text(problem or "")
+    if any(k in problem_text for k in ("موسيقى", "اغاني", "أغاني", "music", "spotify", "سبوتيفاي", "يوتيوب", "youtube")):
+        ytdlp_version = getattr(yt_dlp, "version", None) if yt_dlp else "غير مثبت"
+        cookie_count = len(YOUTUBE_COOKIE_FILES)
+        ffmpeg_ok = bool(shutil.which("ffmpeg"))
+        return (
+            "🎵 تشخيص الموسيقى المباشر\n"
+            "━━━━━━━━━━━━━━\n"
+            "🔎 التشخيص: مشكلة التشغيل ليست من نظام الهدايا.\n"
+            "⚠️ السبب الظاهر: YouTube يرفض جلسة التنزيل برسالة Sign in to confirm you're not a bot.\n"
+            f"• yt-dlp: {ytdlp_version}\n"
+            f"• FFmpeg: {'✅ موجود' if ffmpeg_ok else '❌ غير موجود'}\n"
+            f"• جلسات YouTube: {cookie_count}\n"
+            "• النظام يحاول المصادر البديلة قبل إعادة المحاولة المتكررة.\n"
+            "🛠️ الإجراء: سيتم الاعتماد على المصادر البديلة أولاً، ثم yt-dlp كخيار احتياطي.\n"
+            "🧪 التحقق: أرسل «.تشغيل اسم الأغنية» ثم راقب نتيجة التشغيل.\n"
+            "━━━━━━━━━━━━━━\n"
+            "💡 إذا استمر رفض YouTube، يلزم تحديث جلسة YouTube/Cookies من Railway بشكل خاص؛ لا ترسلها داخل المحادثة."
+        ), None
+
     report = {
         "python": sys.version.split()[0],
         "yt_dlp": getattr(yt_dlp, "version", None) if yt_dlp else "غير مثبت",
@@ -4702,7 +4724,9 @@ async def dm_loop():
                     is_owner = (await username_of(sender)).lower() == OWNER
                     reply = ""
                     # رد فوري + مؤشر تقدم للماستر أثناء الأوامر البطيئة.
-                    master_like = is_owner and bool(text)
+                    # لا نرسل مؤشر تقدم متكرر مع أوامر التشخيص؛ التشخيص المباشر يجب أن يعيد نتيجة واحدة.
+                    is_diagnostic_command = low.startswith(("اصلاح ذكي ", "إصلاح ذكي "))
+                    master_like = is_owner and bool(text) and not is_diagnostic_command
                     progress_task = None
                     progress_stop = None
                     started_at = time.time()
