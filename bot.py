@@ -961,10 +961,13 @@ PUBLISH_PUBLIC_BASE_URL = str(C.get("publish_public_base_url", "")).rstrip("/")
 GAME_BUCKET = str(C.get("game_bucket", "bot-games")).strip()
 GIFT_RENDER_DIR = BASE_DIR / "generated_gifts"
 GIFT_RENDER_DIR.mkdir(parents=True, exist_ok=True)
-DEFAULT_GIFT_FONT = str(Path(__file__).resolve().parent / "assets" / "Amiri-Bold.ttf")
+# خط عربي واضح للهدايا. NotoSansArabic يعمل جيداً مع Pillow/RAQM للنص العربي.
+DEFAULT_GIFT_FONT = str(Path(__file__).resolve().parent / "assets" / "NotoSansArabic-SemiBold.ttf")
 FONT_PATH = str(C.get("gift_font", DEFAULT_GIFT_FONT))
 if not Path(FONT_PATH).exists():
-    FONT_PATH = DEFAULT_GIFT_FONT
+    FONT_PATH = str(Path(__file__).resolve().parent / "assets" / "Amiri-Bold.ttf")
+if not Path(FONT_PATH).exists():
+    FONT_PATH = str(Path(__file__).resolve().parent / "assets" / "NotoSansArabic-SemiBold.ttf")
 
 def shape_text(value):
     text = str(value)
@@ -1122,13 +1125,12 @@ def _fit_crop(im, size):
     return src.crop((left, top, left + w, top + h)).convert("RGBA")
 
 def shape_text(value):
-    text = str(value or "")
-    if arabic_reshaper and get_display and any("\u0600" <= ch <= "\u06ff" for ch in text):
-        try:
-            return get_display(arabic_reshaper.reshape(text))
-        except Exception:
-            pass
-    return text
+    # لا نعكس النص هنا. Pillow مع RAQM يعالج العربية واتجاه RTL بنفسه.
+    # قلب النص ثم تمريره إلى draw.text كان سبب ظهور الأسماء العربية معكوسة.
+    return str(value or "")
+
+def _text_direction(text):
+    return "rtl" if any("\u0600" <= ch <= "\u06ff" for ch in str(text)) else "ltr"
 
 def fit_font(text, max_width, start_size=42, min_size=18):
     if not PIL_AVAILABLE:
@@ -1143,13 +1145,19 @@ def fit_font(text, max_width, start_size=42, min_size=18):
     return ImageFont.truetype(FONT_PATH, min_size)
 
 def _draw_centered_text(draw, xy, text, font, fill, stroke_fill=None, stroke_width=0):
-    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+    text = str(text or "")
+    direction = _text_direction(text)
+    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width, direction=direction)
     tw = bbox[2] - bbox[0]
     th = bbox[3] - bbox[1]
     x = int(xy[0] - tw / 2 - bbox[0])
     y = int(xy[1] - th / 2 - bbox[1])
-    draw.text((x, y), text, font=font, fill=fill,
-              stroke_width=stroke_width, stroke_fill=stroke_fill)
+    kwargs = dict(font=font, fill=fill, stroke_width=stroke_width, stroke_fill=stroke_fill)
+    # direction مدعوم عند وجود libraqm؛ وهو الموجود في بيئة Pillow الحديثة.
+    try:
+        draw.text((x, y), text, direction=direction, language="ar" if direction == "rtl" else None, **kwargs)
+    except TypeError:
+        draw.text((x, y), text, **kwargs)
     return x, y
 
 def render_gift_image(gift, sender_name, receiver_name, background_path=None):
@@ -1174,12 +1182,15 @@ def render_gift_image(gift, sender_name, receiver_name, background_path=None):
     draw = ImageDraw.Draw(image)
 
     gold = (244, 196, 92, 255)
-    panel = (10, 14, 28, 238)
+    # مهم جداً: القالب القديم يحتوي نصوصاً مرسومة مسبقاً. يجب تغطيتها بالكامل،
+    # وليس استخدام شفافية، حتى لا تظهر الأسماء/العنوان القديمان خلف النص الجديد.
+    panel = (10, 14, 28, 255)
 
     # عنوان الهدية ديناميكي: نفس القالب، لكن اسم كل هدية يتغير.
     header_box = (int(width * 0.27), 65, int(width * 0.73), 205)
     draw.rounded_rectangle(header_box, radius=48, fill=panel, outline=gold, width=4)
-    gift_title = shape_text(f"{gift.get('emoji', '🎁')}  هدية {gift.get('name', 'هدية')}  {gift.get('emoji', '🎁')}")
+    # لا نرسم الإيموجي داخل الخط العربي حتى لا تظهر مربعات/رموز غريبة.
+    gift_title = shape_text(f"هدية {gift.get('name', 'هدية')}")
     header_font = fit_font(gift_title, header_box[2] - header_box[0] - 50, 44, 24)
     _draw_centered_text(draw, ((header_box[0] + header_box[2]) / 2, 135),
                         gift_title, header_font, (255, 222, 155, 255),
@@ -1192,7 +1203,7 @@ def render_gift_image(gift, sender_name, receiver_name, background_path=None):
         draw.rounded_rectangle(box, radius=34, fill=panel, outline=gold, width=4)
 
     # عناوين صغيرة داخل المستطيلين.
-    label_font = ImageFont.truetype(FONT_PATH, 28)
+    label_font = ImageFont.truetype(FONT_PATH, 30)
     _draw_centered_text(draw, ((left[0] + left[2]) / 2, left[1] + 35),
                         shape_text("إلى"), label_font, (255, 224, 165, 255))
     _draw_centered_text(draw, ((right[0] + right[2]) / 2, right[1] + 35),
@@ -1205,8 +1216,8 @@ def render_gift_image(gift, sender_name, receiver_name, background_path=None):
     ]
     receiver_text = shape_text(receiver_name)
     sender_text = shape_text(sender_name)
-    receiver_font = fit_font(receiver_text, left[2] - left[0] - 50, 46, 20)
-    sender_font = fit_font(sender_text, right[2] - right[0] - 50, 46, 20)
+    receiver_font = fit_font(receiver_text, left[2] - left[0] - 42, 42, 20)
+    sender_font = fit_font(sender_text, right[2] - right[0] - 42, 42, 20)
     receiver_color, sender_color = random.sample(colors, 2)
     _draw_centered_text(draw, ((left[0] + left[2]) / 2, left[1] + (left[3] - left[1]) * 0.62),
                         receiver_text, receiver_font, receiver_color,
