@@ -962,12 +962,29 @@ GAME_BUCKET = str(C.get("game_bucket", "bot-games")).strip()
 GIFT_RENDER_DIR = BASE_DIR / "generated_gifts"
 GIFT_RENDER_DIR.mkdir(parents=True, exist_ok=True)
 # خط عربي واضح للهدايا. NotoSansArabic يعمل جيداً مع Pillow/RAQM للنص العربي.
+# خطوط بطاقات الهدايا:
+# - FONT_PATH للعربية، ونتركه كما هو حتى لا تتغير الكتابة العربية.
+# - LATIN_FONT_PATH للإنجليزية/اللاتينية حتى لا تظهر الحروف الإنجليزية كمربعات.
 DEFAULT_GIFT_FONT = str(Path(__file__).resolve().parent / "assets" / "NotoSansArabic-SemiBold.ttf")
 FONT_PATH = str(C.get("gift_font", DEFAULT_GIFT_FONT))
 if not Path(FONT_PATH).exists():
     FONT_PATH = str(Path(__file__).resolve().parent / "assets" / "Amiri-Bold.ttf")
 if not Path(FONT_PATH).exists():
     FONT_PATH = str(Path(__file__).resolve().parent / "assets" / "NotoSansArabic-SemiBold.ttf")
+
+DEFAULT_LATIN_FONT = str(Path(__file__).resolve().parent / "assets" / "DejaVuSans.ttf")
+LATIN_FONT_PATH = str(C.get("gift_latin_font", DEFAULT_LATIN_FONT))
+if not Path(LATIN_FONT_PATH).exists():
+    for _latin_candidate in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ):
+        if Path(_latin_candidate).exists():
+            LATIN_FONT_PATH = _latin_candidate
+            break
+if not Path(LATIN_FONT_PATH).exists():
+    # NotoSansArabic يحتوي على Latin أيضاً، ويظل كحل احتياطي.
+    LATIN_FONT_PATH = FONT_PATH
 
 def shape_text(value):
     text = str(value)
@@ -1129,20 +1146,35 @@ def shape_text(value):
     # قلب النص ثم تمريره إلى draw.text كان سبب ظهور الأسماء العربية معكوسة.
     return str(value or "")
 
+def _has_arabic(text):
+    return any(
+        ("\u0600" <= ch <= "\u06ff")
+        or ("\u0750" <= ch <= "\u077f")
+        or ("\u08a0" <= ch <= "\u08ff")
+        for ch in str(text or "")
+    )
+
 def _text_direction(text):
-    return "rtl" if any("\u0600" <= ch <= "\u06ff" for ch in str(text)) else "ltr"
+    return "rtl" if _has_arabic(text) else "ltr"
+
+def _font_path_for_text(text):
+    # لا نغير الخط العربي إطلاقاً. الإنجليزية فقط تستخدم خطاً لاتينياً
+    # مضمّناً داخل المشروع، لتجنب ظهورها على شكل □□□□ في Railway/Pydroid.
+    return FONT_PATH if _has_arabic(text) else LATIN_FONT_PATH
 
 def fit_font(text, max_width, start_size=42, min_size=18):
     if not PIL_AVAILABLE:
         raise RuntimeError("Pillow غير مثبتة")
+    text = str(text or "")
+    font_path = _font_path_for_text(text)
     size = start_size
     while size >= min_size:
-        font = ImageFont.truetype(FONT_PATH, size)
+        font = ImageFont.truetype(font_path, size)
         bbox = font.getbbox(text)
         if (bbox[2] - bbox[0]) <= max_width:
             return font
         size -= 2
-    return ImageFont.truetype(FONT_PATH, min_size)
+    return ImageFont.truetype(font_path, min_size)
 
 def _draw_centered_text(draw, xy, text, font, fill, stroke_fill=None, stroke_width=0):
     text = str(text or "")
@@ -1203,6 +1235,7 @@ def render_gift_image(gift, sender_name, receiver_name, background_path=None):
         draw.rounded_rectangle(box, radius=34, fill=panel, outline=gold, width=4)
 
     # عناوين صغيرة داخل المستطيلين.
+    # عناوين "إلى" و"من" عربية: استخدم الخط العربي الحالي دون أي تغيير.
     label_font = ImageFont.truetype(FONT_PATH, 30)
     _draw_centered_text(draw, ((left[0] + left[2]) / 2, left[1] + 35),
                         shape_text("إلى"), label_font, (255, 224, 165, 255))

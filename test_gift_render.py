@@ -50,3 +50,9 @@ center(d,((right[0]+right[2])/2,right[1]+125),"السفير",font,(100,220,255,2
 im.save(out,"PNG")
 print(out)
 print(im.size)
+
+
+# Regression cases:
+# 1) Arabic must remain Arabic and unchanged.
+# 2) Latin usernames must render as real Latin glyphs, not square boxes.
+# The production renderer selects DejaVuSans.ttf automatically for Latin-only names.
