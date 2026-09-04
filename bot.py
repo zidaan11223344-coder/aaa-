@@ -2042,10 +2042,9 @@ async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=No
                 if not clients_list:
                     clients_list = ["default"]
 
-                # جرّب كل عميل مع الجلسة الحالية، ثم بدون Cookies.
-                # وإذا كانت هناك عدة جلسات في Railway، دوّر بينها بدل استخدام الأولى دائمًا.
-                account_pairs = [(cf, True) for cf in cookie_files]
-                account_pairs.append((None, False))
+                # ابدأ بدون Cookies لأن الجلسات القديمة هي أكثر سبب شائع لرفض YouTube
+                # في المقاطع العامة. ثم جرّب جلسات Railway كاحتياط، بالتناوب.
+                account_pairs = [(None, False)] + [(cf, True) for cf in cookie_files]
                 n = 0
                 for cookie_file, use_cookies in account_pairs:
                     for client in clients_list:
@@ -2068,37 +2067,53 @@ async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=No
                         return max(files, key=lambda p: p.stat().st_size)
                 except Exception as e:
                     cookie_tag = f"account-{account_idx + 1}" if use_cookies else "بدون-cookies"
-                    errors.append(f"yt-dlp [{fmt}][{cookie_tag}]: {type(e).__name__}: {e}")
+                    err_text = f"{type(e).__name__}: {e}"
+                    errors.append(f"yt-dlp [{fmt}][{cookie_tag}]: {err_text}")
                     log.warning("yt-dlp audio failed (%s,%s): %s", fmt, cookie_tag, e)
+                    if "Sign in to confirm" in str(e) or "not a bot" in str(e).lower():
+                        # نفس جلسة YouTube لن تنجح بتغيير الصيغة فقط؛ انتقل مباشرة
+                        # إلى الجلسة/العميل التالي بدلاً من إهدار وقت الطلب.
+                        break
             return None
 
         async def try_piped():
-            if not (piped_api and video_id):
+            # لا نعتمد على خادم Piped واحد؛ الخوادم العامة تتعطل أو تتغير كثيراً.
+            # نبدأ بالخادم الذي أعاد نتيجة البحث ثم ندوّر على بقية الخوادم.
+            apis = []
+            for api in [piped_api, *PIPED_APIS]:
+                api = str(api or "").strip().rstrip("/")
+                if api and api not in apis:
+                    apis.append(api)
+            if not video_id or not apis:
                 return None
-            try:
-                async with http.get(f"{piped_api}/streams/{video_id}", timeout=aiohttp.ClientTimeout(total=25), headers={"User-Agent":"Mozilla/5.0"}) as resp:
-                    if resp.status != 200:
-                        errors.append(f"Piped {piped_api}: HTTP {resp.status}")
-                        return None
-                    info = await resp.json(content_type=None)
-                streams = sorted(info.get("audioStreams") or [], key=lambda x: float(x.get("bitrate") or 0), reverse=True)
-                for stream in streams:
-                    url = stream.get("url")
-                    if not url: continue
-                    try:
-                        ext = ".m4a" if "mp4" in str(stream.get("mimeType", "")) else ".webm"
-                        out = temp_dir / f"audio{ext}"
-                        async with http.get(url, timeout=aiohttp.ClientTimeout(total=120)) as ar:
-                            if ar.status != 200:
-                                continue
-                            with out.open("wb") as f:
-                                async for chunk in ar.content.iter_chunked(1024 * 256): f.write(chunk)
-                        if out.is_file() and out.stat().st_size > 4096:
-                            return out
-                    except Exception as e:
-                        errors.append(f"Piped audio stream: {type(e).__name__}: {e}")
-            except Exception as e:
-                errors.append(f"Piped {piped_api}: {type(e).__name__}: {e}")
+            for api in apis:
+                try:
+                    async with http.get(f"{api}/streams/{video_id}", timeout=aiohttp.ClientTimeout(total=25), headers={"User-Agent":"Mozilla/5.0"}) as resp:
+                        if resp.status != 200:
+                            errors.append(f"Piped {api}: HTTP {resp.status}")
+                            continue
+                        info = await resp.json(content_type=None)
+                    streams = sorted(info.get("audioStreams") or [], key=lambda x: float(x.get("bitrate") or 0), reverse=True)
+                    for stream in streams:
+                        url = stream.get("url")
+                        if not url:
+                            continue
+                        try:
+                            ext = ".m4a" if "mp4" in str(stream.get("mimeType", "")) else ".webm"
+                            out = temp_dir / f"audio{ext}"
+                            async with http.get(url, timeout=aiohttp.ClientTimeout(total=120), headers={"User-Agent":"Mozilla/5.0"}) as ar:
+                                if ar.status != 200:
+                                    continue
+                                with out.open("wb") as f:
+                                    async for chunk in ar.content.iter_chunked(1024 * 256):
+                                        f.write(chunk)
+                            if out.is_file() and out.stat().st_size > 4096:
+                                return out
+                        except Exception as e:
+                            errors.append(f"Piped audio stream {api}: {type(e).__name__}: {e}")
+                except Exception as e:
+                    errors.append(f"Piped {api}: {type(e).__name__}: {e}")
+                    log.warning("Piped audio failed %s: %s", api, e)
             return None
 
         if prefer_ytdlp:
