@@ -1174,7 +1174,7 @@ def render_gift_image(gift, sender_name, receiver_name, background_path=None):
         (receiver_name, to_y, receiver_color),
     ):
         # الاسم فقط داخل المستطيل، بدون كتابة "المرسل" أو "المستقبل" وبدون تكرار اسم الهدية.
-        text = shape_text(f"@{name}")
+        text = shape_text(f"{name}")
         font = fit_font(text, max_width)
         bbox = draw.textbbox((0, 0), text, font=font, stroke_width=1)
         x = (width - (bbox[2] - bbox[0])) // 2
