@@ -4927,11 +4927,45 @@ async def main():
         await http.close()
 
 async def resolve_email():
-    """Use the deterministic username mapping from the working control bot."""
+    """Resolve the internal Auth email from Giant username before fallback mapping."""
+    username = USERNAME.strip()
+    if not username:
+        raise RuntimeError("اسم مستخدم Giant Chat غير مضبوط.")
+
+    # The mobile app asks for username/password, while Supabase Auth expects
+    # the account's internal email. The RPC also handles Arabic usernames.
+    try:
+        data, err = await rpc("lookup_auth_email", {"_username": username})
+        if not err and isinstance(data, str) and "@" in data:
+            log.info("تم العثور على بريد المصادقة الداخلي عبر Giant")
+            return data.strip()
+        if err:
+            log.warning("تعذر lookup_auth_email: %s", safe_auth_error(err, (PASSWORD, C.get("supabase_key", ""))))
+    except Exception as exc:
+        log.warning("تعذر البحث عن بريد المصادقة الداخلي عبر Giant: %s", safe_auth_error(exc, (PASSWORD, C.get("supabase_key", ""))))
+
+    # Compatibility path for older accounts whose internal email is on profile.
+    try:
+        rows, err = await table_select(
+            lambda: sb.table("profiles").select("auth_email").eq("username", username).limit(1).execute()
+        )
+        if not err and rows and rows[0].get("auth_email"):
+            email = str(rows[0]["auth_email"]).strip()
+            if "@" in email:
+                log.info("تم العثور على بريد المصادقة الداخلي من ملف الحساب")
+                return email
+        if err:
+            log.warning("تعذر قراءة بريد المصادقة من الملف الشخصي: %s", safe_auth_error(err, (PASSWORD, C.get("supabase_key", ""))))
+    except Exception as exc:
+        log.warning("تعذر قراءة بريد المصادقة من الملف الشخصي: %s", safe_auth_error(exc, (PASSWORD, C.get("supabase_key", ""))))
+
     email = giant_auth_email(USERNAME)
     if not email:
-        raise RuntimeError("تعذر تحديد بريد الحساب من اسم المستخدم")
-    log.info("استخدام تحويل اسم مستخدم Giant إلى بريد المصادقة الداخلي")
+        raise RuntimeError(
+            "تعذر تحديد بريد المصادقة الداخلي لهذا الاسم. لم يُرجع Giant بريدًا للحساب. "
+            "تحقق من أن GIANT_USERNAME يطابق اسم حساب Giant Chat حرفيًا ومن نشر إعدادات الخدمة الأخيرة."
+        )
+    log.info("استخدام تحويل اسم المستخدم الاحتياطي لتسجيل الدخول")
     return email
 
 async def join(name):
