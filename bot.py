@@ -43,7 +43,16 @@ from datetime import datetime, timezone
 import aiohttp
 from aiohttp import web
 import requests
-from auth_helpers import create_supabase_client, safe_auth_error
+from auth_helpers import (
+    create_supabase_client,
+    giant_auth_email,
+    safe_auth_error,
+    select_supabase_key,
+)
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
 # ----------------------------- الذكاء الاصطناعي المحلي -----------------------------
 # لا يستخدم OpenAI ولا يحتاج إلى مفتاح API.
@@ -106,6 +115,9 @@ GAME_DESIGN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gam
 APPROVED_GAMES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "games", "approved")
 
 
+if load_dotenv:
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 with open(CONFIG_PATH, encoding="utf-8") as f:
@@ -115,13 +127,17 @@ with open(CONFIG_PATH, encoding="utf-8") as f:
 # Environment Variables لها الأولوية على القيم الموجودة في الملف.
 for _key, _env in (
     ("supabase_url", "SUPABASE_URL"),
-    ("supabase_key", "SUPABASE_KEY"),
     ("username", "GIANT_USERNAME"),
     ("password", "GIANT_PASSWORD"),
     ("owner_username", "OWNER_USERNAME"),
 ):
     if os.environ.get(_env):
         C[_key] = os.environ[_env]
+if os.environ.get("SUPABASE_URL"):
+    C["supabase_url"] = os.environ["SUPABASE_URL"].strip().rstrip("/")
+_environment_supabase_key = select_supabase_key(os.environ)
+if _environment_supabase_key:
+    C["supabase_key"] = _environment_supabase_key
 
 REQUIRED = ["supabase_url", "supabase_key", "username", "password"]
 missing = [k for k in REQUIRED if not str(C.get(k, "")).strip()]
@@ -4911,50 +4927,12 @@ async def main():
         await http.close()
 
 async def resolve_email():
-    """Resolve Giant Chat username exactly like the mobile/web app.
-
-    The app first uses lookup_auth_email, but its guaranteed fallback is
-    <username>@giant.app. This lets accounts created by the current app
-    authenticate even when the RPC is unavailable to the bot key.
-    """
-    username = USERNAME.strip()
-    if not username:
-        raise RuntimeError("اسم المستخدم فارغ")
-
-    # Same deterministic email mapping used by the app during sign-up/login.
-    normalized = re.sub(r"[^a-z0-9_]", "", username.lower())
-    if normalized:
-        default_email = f"{normalized}@giant.app"
-    else:
-        default_email = ""
-
-    # Try the RPC first when available, but never make it a hard dependency.
-    try:
-        data, err = await rpc("lookup_auth_email", {"_username": username})
-        if not err and isinstance(data, str) and "@" in data:
-            log.info("تم العثور على بريد الحساب عبر lookup_auth_email")
-            return data.strip()
-    except Exception as e:
-        log.warning("lookup_auth_email failed; using app email mapping: %s", str(e)[:180])
-
-    # Keep the profiles fallback for older accounts that explicitly store auth_email.
-    try:
-        rows, err = await table_select(
-            lambda: sb.table("profiles").select("auth_email").eq("username", username).limit(1).execute()
-        )
-        if not err and rows and rows[0].get("auth_email"):
-            email = str(rows[0]["auth_email"]).strip()
-            if "@" in email:
-                log.info("تم العثور على بريد الحساب من profiles")
-                return email
-    except Exception as e:
-        log.warning("profiles email lookup failed: %s", str(e)[:180])
-
-    if default_email:
-        log.info("استخدام بريد Giant Chat الافتراضي للحساب: %s@giant.app", normalized)
-        return default_email
-
-    raise RuntimeError("تعذر تحديد بريد الحساب")
+    """Use the deterministic username mapping from the working control bot."""
+    email = giant_auth_email(USERNAME)
+    if not email:
+        raise RuntimeError("تعذر تحديد بريد الحساب من اسم المستخدم")
+    log.info("استخدام تحويل اسم مستخدم Giant إلى بريد المصادقة الداخلي")
+    return email
 
 async def join(name):
     room = await find_room(name)

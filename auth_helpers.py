@@ -6,6 +6,27 @@ from typing import Callable, Iterable, Any
 
 
 _NEW_KEY_PREFIXES = ("sb_publishable_", "sb_secret_")
+_SUPABASE_KEY_ENV_NAMES = (
+    "SUPABASE_PUBLISHABLE_KEY",
+    "SUPABASE_ANON_KEY",
+    "SUPABASE_SECRET_KEY",
+    "SUPABASE_KEY",
+)
+
+
+def select_supabase_key(environ) -> str:
+    """Select the first configured key using the working control bot's order."""
+    for name in _SUPABASE_KEY_ENV_NAMES:
+        value = str(environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def giant_auth_email(username: str) -> str:
+    """Map a Giant Chat username to the deterministic Supabase auth email."""
+    normalized = re.sub(r"[^a-z0-9_]", "", str(username or "").strip().lower())
+    return f"{normalized}@giant.app" if normalized else ""
 
 
 def create_supabase_client(url: str, key: str, client_factory: Callable[[str, str], Any]):

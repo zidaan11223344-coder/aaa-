@@ -1,6 +1,11 @@
 import unittest
 
-from auth_helpers import create_supabase_client, safe_auth_error
+from auth_helpers import (
+    create_supabase_client,
+    giant_auth_email,
+    safe_auth_error,
+    select_supabase_key,
+)
 
 
 class FakeOptions:
@@ -23,6 +28,21 @@ class AuthHelperTests(unittest.TestCase):
             return FakeClient()
 
         self.factory = factory
+
+    def test_publishable_environment_key_takes_precedence(self):
+        env = {
+            "SUPABASE_PUBLISHABLE_KEY": " sb_publishable_current ",
+            "SUPABASE_ANON_KEY": "old-anon",
+            "SUPABASE_KEY": "legacy",
+        }
+        self.assertEqual(select_supabase_key(env), "sb_publishable_current")
+
+    def test_generic_environment_key_is_fallback(self):
+        self.assertEqual(select_supabase_key({"SUPABASE_KEY": " legacy-key "}), "legacy-key")
+
+    def test_giant_username_uses_internal_auth_email_mapping(self):
+        self.assertEqual(giant_auth_email("My.User-01"), "myuser01@giant.app")
+        self.assertEqual(giant_auth_email("!!!"), "")
 
     def test_publishable_key_replaces_placeholder_header(self):
         key = "sb_publishable_test-value"
