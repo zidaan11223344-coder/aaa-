@@ -4927,13 +4927,38 @@ async def main():
         await http.close()
 
 async def resolve_email():
-    """Resolve the internal Auth email from Giant username before fallback mapping."""
+    """Resolve the internal Auth email using the current Giant Android app flow."""
     username = USERNAME.strip()
     if not username:
         raise RuntimeError("اسم مستخدم Giant Chat غير مضبوط.")
 
-    # The mobile app asks for username/password, while Supabase Auth expects
-    # the account's internal email. The RPC also handles Arabic usernames.
+    # Giant Chat 1.0.375 first calls POST /api/public/login-email with
+    # {"username": username}; the mobile UI still only asks for username/password.
+    configured_origin = str(
+        os.environ.get("GIANT_SITE_ORIGIN")
+        or C.get("giant_site_origin")
+        or "https://giant-chat-app.lovable.app"
+    ).strip().rstrip("/")
+    origins = list(dict.fromkeys((configured_origin, "https://giant-chat-app.lovable.app")))
+    for origin in origins:
+        try:
+            async with http.post(
+                f"{origin}/api/public/login-email",
+                json={"username": username},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+                if response.status != 200:
+                    log.warning("Giant login-email endpoint returned HTTP %s", response.status)
+                    continue
+                payload = await response.json(content_type=None)
+                email = str(payload.get("email") or "").strip() if isinstance(payload, dict) else ""
+                if email and "@" in email and email.lower() != "null":
+                    log.info("تم حل بريد المصادقة عبر واجهة تسجيل الدخول الرسمية في Giant")
+                    return email
+        except Exception as exc:
+            log.warning("تعذر الاتصال بواجهة login-email في Giant: %s", safe_auth_error(exc, (PASSWORD, C.get("supabase_key", ""))))
+
+    # Fallbacks for older deployments/accounts if the app endpoint is unavailable.
     try:
         data, err = await rpc("lookup_auth_email", {"_username": username})
         if not err and isinstance(data, str) and "@" in data:

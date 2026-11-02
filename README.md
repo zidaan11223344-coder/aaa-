@@ -21,7 +21,7 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-قبل التشغيل، يقرأ البوت ملف `.env` المحلي ومتغيرات بيئة الاستضافة. يختار مفتاح Supabase بهذا الترتيب: `SUPABASE_PUBLISHABLE_KEY` ثم `SUPABASE_ANON_KEY` ثم `SUPABASE_SECRET_KEY` ثم `SUPABASE_KEY`، ثم يرجع إلى `config.json` عند غيابها. كذلك يحتاج `SUPABASE_URL` و`GIANT_USERNAME` و`GIANT_PASSWORD`. يدعم مفاتيح `sb_publishable_` و`sb_secret_` ومفاتيح `anon`/`service_role` القديمة بصيغة JWT. لا تستخدم `sb_secret_` داخل تطبيق الهاتف، ولا ترفع كلمات المرور أو مفاتيح Supabase إلى مستودع عام؛ غيّر أي بيانات اعتماد سبق نشرها.
+قبل التشغيل، يقرأ البوت ملف `.env` المحلي ومتغيرات بيئة الاستضافة. يختار مفتاح Supabase بهذا الترتيب: `SUPABASE_PUBLISHABLE_KEY` ثم `SUPABASE_ANON_KEY` ثم `SUPABASE_SECRET_KEY` ثم `SUPABASE_KEY`، ثم يرجع إلى `config.json` عند غيابها. كذلك يحتاج `SUPABASE_URL` و`GIANT_USERNAME` و`GIANT_PASSWORD`. يحل البوت بريد المصادقة الداخلي بالطريقة نفسها التي يستخدمها تطبيق Giant الحالي (`POST /api/public/login-email`)، لكن بيانات الحساب المطلوبة من المستخدم تظل اسم المستخدم وكلمة المرور. يدعم مفاتيح `sb_publishable_` و`sb_secret_` ومفاتيح `anon`/`service_role` القديمة بصيغة JWT. لا تستخدم `sb_secret_` داخل تطبيق الهاتف، ولا ترفع كلمات المرور أو مفاتيح Supabase إلى مستودع عام؛ غيّر أي بيانات اعتماد سبق نشرها.
 
 في Pydroid 3 استخدم `requirements_pydroid.txt` لتثبيت المتطلبات الأساسية، خصوصًا إذا ظهر خطأ بناء `python-bidi` أو تعذر تحميل Pillow. مكتبتا Pillow و`python-bidi` اختياريتان بالنسبة لتشغيل الأغاني؛ عند غيابهما يستمر البوت والأغاني، لكن صور الهدايا الديناميكية لا تُنشأ حتى تثبيت مكتبات الصور لاحقًا. النسخة الأخيرة تحتوي كذلك على `music_worker` و`music_tasks` لتشغيل البحث في الخلفية.
 
