@@ -40,10 +40,10 @@ import io
 from pathlib import Path
 from urllib.parse import quote
 from datetime import datetime, timezone
-
 import aiohttp
 from aiohttp import web
 import requests
+from auth_helpers import create_supabase_client, safe_auth_error
 
 # ----------------------------- الذكاء الاصطناعي المحلي -----------------------------
 # لا يستخدم OpenAI ولا يحتاج إلى مفتاح API.
@@ -336,25 +336,7 @@ PUBLIC_BASE_URL = _MANUAL_PUBLIC_BASE_URL or (f"https://{_RAILWAY_DOMAIN}" if _R
 MEDIA_PATH = "/media"
 MEDIA_SERVER_PORT = int(os.environ.get("PORT", "8080"))
 
-def create_supabase_client(url, key):
-    """إنشاء عميل يدعم مفاتيح Supabase الجديدة sb_publishable_.
-
-    supabase-py 2.15 يتحقق محليًا من أن المفتاح JWT، بينما publishable
-    ليس JWT. نستخدم قيمة JWT شكلية فقط لتجاوز الفحص المحلي، ثم نستبدل
-    رأس الاتصال الحقيقي إلى apiKey بالمفتاح publishable.
-    """
-    if str(key).startswith("sb_publishable_"):
-        placeholder_jwt = "a.b.c"
-        client = create_client(url, placeholder_jwt)
-        client.supabase_key = key
-        headers = client.options.headers
-        headers["apiKey"] = key
-        headers.pop("Authorization", None)
-        return client
-    return create_client(url, key)
-
-
-sb = create_supabase_client(C["supabase_url"], C["supabase_key"])
+sb = create_supabase_client(C["supabase_url"], C["supabase_key"], create_client)
 
 BOT_ID = None
 AUTH_ACCESS_TOKEN = None
@@ -4894,7 +4876,11 @@ async def main():
             log.exception("startup self-repair failed")
         email = await resolve_email()
         res, err = await run(lambda: sb.auth.sign_in_with_password({"email": email, "password": PASSWORD}))
-        if err or not res.user: raise RuntimeError("فشل الدخول")
+        if err:
+            detail = safe_auth_error(err, (PASSWORD, C.get("supabase_key", "")))
+            raise RuntimeError(f"تعذر تسجيل الدخول إلى Giant Chat: {detail}")
+        if not res or not getattr(res, "user", None):
+            raise RuntimeError("رفض Giant Chat تسجيل الدخول ولم يُرجع مستخدمًا.")
         BOT_ID = res.user.id
         cookie_ok, cookie_msg = youtube_cookie_status()
         log.info("YouTube cookies: %s | %s", "OK" if cookie_ok else "NOT-READY", cookie_msg)

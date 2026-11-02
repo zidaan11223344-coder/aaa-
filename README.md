@@ -21,7 +21,7 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-قبل التشغيل: ضع كلمة مرور حساب البوت في `config.json` (الحقل `password`). يدعم هذا الإصدار مفتاح Supabase الجديد الذي يبدأ بـ `sb_publishable_`، ولا يحتاج إلى تحويله إلى مفتاح JWT قديم.
+قبل التشغيل، اضبط `SUPABASE_URL` و`SUPABASE_KEY` و`GIANT_USERNAME` و`GIANT_PASSWORD` كمتغيرات بيئة/أسرار في الاستضافة؛ ويمكن استخدام `config.json` للتشغيل المحلي فقط. يدعم هذا الإصدار مفاتيح `sb_publishable_` و`sb_secret_` ومفاتيح `anon`/`service_role` القديمة بصيغة JWT. لا تستخدم `sb_secret_` داخل تطبيق الهاتف، ولا ترفع كلمات المرور أو مفاتيح Supabase إلى مستودع عام؛ غيّر أي بيانات اعتماد سبق نشرها.
 
 في Pydroid 3 استخدم `requirements_pydroid.txt` لتثبيت المتطلبات الأساسية، خصوصًا إذا ظهر خطأ بناء `python-bidi` أو تعذر تحميل Pillow. مكتبتا Pillow و`python-bidi` اختياريتان بالنسبة لتشغيل الأغاني؛ عند غيابهما يستمر البوت والأغاني، لكن صور الهدايا الديناميكية لا تُنشأ حتى تثبيت مكتبات الصور لاحقًا. النسخة الأخيرة تحتوي كذلك على `music_worker` و`music_tasks` لتشغيل البحث في الخلفية.
 
