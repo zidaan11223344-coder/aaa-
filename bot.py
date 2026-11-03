@@ -37,6 +37,7 @@ import base64
 import subprocess
 import zipfile
 import io
+import threading
 from pathlib import Path
 from urllib.parse import quote
 from datetime import datetime, timezone
@@ -79,6 +80,19 @@ try:
 except ImportError:
     yt_dlp = None
 from supabase import create_client
+from explore_cards import render_explore_card
+from point_transactions import apply_delta_once as apply_point_transaction
+from gift_assets import extend_gift_image_paths
+from giant_game_bridge import GiantGameBridge
+from treasure_mining import ITEMS as MINING_ITEMS, MiningStore, format_cooldown, resolve_item_keys
+from game_engine import (
+    expired_sessions as expired_game_sessions,
+    game_type_of,
+    get_session as get_game_session,
+    handle_message as handle_game_message,
+    start_session as start_game_session,
+    timeout_text as game_timeout_text,
+)
 
 # ----------------------------- إعداد السجلات -----------------------------
 os.makedirs("logs", exist_ok=True)
@@ -96,6 +110,7 @@ log = logging.getLogger("alsfer")
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 POINTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "points.json")
 GIFT_POINTS_LOCK = asyncio.Lock()
+POINTS_LOCK = threading.RLock()
 REPLIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "replies.json")
 MASTERS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "masters.json")
 MUTES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mutes.json")
@@ -741,10 +756,47 @@ def get_user_data(uid, username):
     return points, points[uid]
 
 def add_points(uid, username, amount):
-    points, user_data = get_user_data(uid, username)
-    user_data["points"] += amount
-    points[uid] = user_data
-    save_points(points)
+    with POINTS_LOCK:
+        points, user_data = get_user_data(str(uid), username)
+        user_data["points"] = int(user_data.get("points", 0) or 0) + int(amount)
+        points[str(uid)] = user_data
+        save_points(points)
+
+
+def apply_point_delta_once(uid, username, amount, transaction_id, reason=""):
+    """Apply one credit/debit exactly once using Giant profile UUID identity."""
+    with POINTS_LOCK:
+        points = load_points()
+        result, changed = apply_point_transaction(points, str(uid), username, int(amount), transaction_id)
+        if changed:
+            save_points(points)
+        return result
+
+
+def recover_mining_redemptions():
+    """Finish durable mining credits that were interrupted by a process restart."""
+    state = load_json(MINING_PATH, {})
+    players = state.get("players", {}) if isinstance(state, dict) else {}
+    if not isinstance(players, dict):
+        return 0
+    recovered = 0
+    for uid, player in players.items():
+        if not isinstance(player, dict):
+            continue
+        pending = player.get("pending_redemption")
+        if not isinstance(pending, dict) or not pending.get("id"):
+            continue
+        try:
+            txid = f"mining-redemption:{pending['id']}"
+            result = apply_point_delta_once(
+                str(uid), str(pending.get("username") or player.get("username") or "مستخدم"),
+                int(pending.get("points", 0) or 0), txid, "mining treasure redemption recovery",
+            )
+            if result.get("ok") and MINING_STORE.complete_redemption(str(uid), str(pending["id"])):
+                recovered += 1
+        except Exception:
+            log.exception("could not recover a pending mining redemption")
+    return recovered
 
 def check_cooldown(uid, username, command, seconds):
     points, user_data = get_user_data(uid, username)
@@ -950,6 +1002,9 @@ GIFT_LOCAL_FILES = {
     for i in range(1, 15)
 }
 BASE_DIR = Path(__file__).resolve().parent
+GIFT_LOCAL_FILES = extend_gift_image_paths(BASE_DIR, GIFT_LOCAL_FILES)
+RUNTIME_STATE_DIR = BASE_DIR / "runtime_state"
+GAME_BRIDGE = None
 GIFT_BUCKET = str(C.get("gift_image_bucket", "bot-gifts")).strip()
 
 # تخزين الوسائط الدائمة: روابط googlevideo مؤقتة لا تُرسل إلى التطبيق.
@@ -962,6 +1017,8 @@ PUBLISH_BUCKET = str(C.get("publish_bucket", "bot-publish")).strip()
 PUBLISH_STORAGE = str(C.get("publish_storage", "supabase")).strip().lower()
 PUBLISH_LOCAL_DIR = BASE_DIR / str(C.get("publish_local_dir", "published_media"))
 PUBLISH_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+MINING_PATH = BASE_DIR / "treasure_mining.json"
+MINING_STORE = MiningStore(MINING_PATH)
 PUBLISH_PUBLIC_BASE_URL = str(C.get("publish_public_base_url", "")).rstrip("/")
 GAME_BUCKET = str(C.get("game_bucket", "bot-games")).strip()
 GIFT_RENDER_DIR = BASE_DIR / "generated_gifts"
@@ -1608,12 +1665,18 @@ def _code4():
 
 async def register_social_codes(post_id, owner_id, owner_name, kind, title="", room_id=None):
     # كود واحد عشوائي من 4 خانات لكل منشور/أغنية، وتستخدمه جميع التفاعلات.
-    code = _code4()
+    posts = load_published_posts()
+    used = {
+        str(value).upper()
+        for item in posts.values() if isinstance(item, dict)
+        for value in (item.get("reaction_codes") or {}).values()
+    }
+    used.update(str(item.get("repost_code") or "").upper() for item in posts.values() if isinstance(item, dict))
+    code = next((candidate for _ in range(128) if (candidate := _code4()).upper() not in used), _code4())
     codes = {
         "like": code, "love": code, "dislike": code,
         "comment": code, "report": code,
     }
-    posts = load_published_posts()
     item = posts.get(str(post_id), {})
     item.update({
         "post_id": str(post_id), "owner_id": str(owner_id), "owner_name": owner_name,
@@ -1679,6 +1742,113 @@ async def handle_social_reaction(rid, text, uid, p_name):
     except Exception:
         log.exception("social private notification failed")
     return f"✅ تم تسجيل {labels[action_key]} وإرسال الإشعار إلى خاص الناشر."
+
+
+async def publish_explore_post(rid, uid, username, text):
+    """Render, persist, and broadcast a Giant-native Explore post."""
+    content = " ".join(str(text or "").split())[:150]
+    if not content:
+        return "❌ استخدم: ax@النص الذي تريد نشره في اكسبلور"
+    if len(content) < 2:
+        return "❌ أضف نصاً أطول قليلاً لمنشور اكسبلور."
+    if check := await check_forbidden_word(rid, content):
+        return f"🚫 لم يُنشر النص لأنه يحتوي كلمة محظورة: {check}"
+    cd_ok, remaining = check_cooldown(uid, username, "explore:publish", int(C.get("explore_cooldown_seconds", 60)))
+    if not cd_ok:
+        return f"⏳ انتظر {remaining} ثانية قبل نشر منشور اكسبلور آخر."
+
+    local_path = None
+    try:
+        font_dir = BASE_DIR / "assets"
+        local_path = await asyncio.to_thread(
+            render_explore_card,
+            content,
+            username,
+            PUBLISH_LOCAL_DIR,
+            regular_font=font_dir / "NotoSansArabic-Regular.ttf",
+            bold_font=font_dir / "NotoSansArabic-SemiBold.ttf",
+        )
+        media_url = await _store_media(local_path, "publish", "image/jpeg")
+        post_id = str(uuid.uuid4())
+        posts = load_published_posts()
+        posts[post_id] = {
+            "post_id": post_id, "owner_id": str(uid), "owner_name": username,
+            "source_room_id": str(rid), "media_url": media_url, "type": "explore",
+            "title": content[:120], "description": content, "created_at": now_iso(),
+        }
+        save_published_posts(posts)
+        codes = await register_social_codes(post_id, uid, username, "explore", content[:120], rid)
+        posts = load_published_posts()
+        item = posts.get(post_id, {})
+        used = {
+            str(value).upper()
+            for other in posts.values() if isinstance(other, dict)
+            for value in (other.get("reaction_codes") or {}).values()
+        }
+        used.update(str(other.get("repost_code") or "").upper() for other in posts.values() if isinstance(other, dict))
+        repost_code = next((candidate for _ in range(128) if (candidate := _code4()).upper() not in used), _code4())
+        item["repost_code"] = repost_code
+        save_published_posts(posts)
+
+        caption = (
+            f"✨ اكسبلور\n👤 @{username}\n━━━━━━━━━━━━\n"
+            f"👍 lk@{codes['like']}   ❤️ lv@{codes['love']}   👎 dl@{codes['dislike']}\n"
+            f"💬 cm@{codes['comment']} نص التعليق   🚨 report@{codes['report']} السبب\n"
+            f"🔁 x@{repost_code} — إعادة نشر"
+        )
+        delivered = await broadcast_media(caption, media_url, "image")
+        return f"✅ تم نشر بطاقة اكسبلور في {delivered} غرفة.\n🔁 كود إعادة النشر: x@{repost_code}"
+    except Exception as exc:
+        log.exception("Explore publish failed")
+        return "❌ تعذر إنشاء أو نشر بطاقة اكسبلور؛ تحقق من إعداد التخزين العام للصور."
+    finally:
+        if local_path:
+            try:
+                Path(local_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+async def repost_explore(rid, uid, username, text):
+    match = re.fullmatch(r"x@([A-Za-z0-9]{4})", str(text or "").strip(), re.I)
+    if not match:
+        return None
+    code = match.group(1).upper()
+    posts = load_published_posts()
+    found_id, post = next((
+        (pid, item) for pid, item in posts.items()
+        if isinstance(item, dict) and str(item.get("repost_code") or "").upper() == code
+    ), (None, None))
+    if not post or post.get("type") != "explore":
+        return "❌ كود إعادة النشر غير صالح."
+    try:
+        created = datetime.fromisoformat(str(post.get("created_at", "")).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, OverflowError):
+        return "❌ انتهت صلاحية منشور اكسبلور أو أن تاريخه غير صالح."
+    if time.time() - created > 86400:
+        return "⌛ انتهت صلاحية إعادة نشر هذا المنشور (24 ساعة)."
+    media_url = str(post.get("media_url") or "")
+    if not media_url.startswith(("https://", "http://")):
+        return "❌ رابط صورة المنشور غير متاح لإعادة النشر."
+    owner_id = str(post.get("owner_id") or "")
+    if owner_id == str(uid):
+        return "⚠️ لا يمكنك إعادة نشر منشورك بنفس الحساب."
+
+    events = load_social_events()
+    event = {
+        "id": str(uuid.uuid4()), "post_id": str(found_id), "type": "repost",
+        "actor_id": str(uid), "actor_name": username, "owner_id": owner_id,
+        "text": "", "room_id": str(rid), "created_at": now_iso(),
+    }
+    events[event["id"]] = event
+    save_social_events(events)
+    post["repost_count"] = int(post.get("repost_count", 0) or 0) + 1
+    posts[str(found_id)] = post
+    save_published_posts(posts)
+    title = str(post.get("title") or "منشور اكسبلور")[:120]
+    caption = f"🔁 إعادة نشر اكسبلور\n👤 الناشر الأصلي: @{post.get('owner_name', 'مستخدم')}\n👤 أعاد النشر: @{username}\n📝 {title}"
+    await room_send_media(rid, caption, media_url, m_type="image")
+    return "✅ تمت إعادة نشر بطاقة اكسبلور في هذه الغرفة."
 
 async def telegram_find_chat_id():
     """Find the latest private Telegram chat that interacted with this bot.
@@ -2364,6 +2534,15 @@ async def start_media_server():
             raise web.HTTPNotFound()
         return web.FileResponse(file_path, headers={"Cache-Control": "public, max-age=86400"})
 
+    async def cricket_result_handler(request):
+        name = os.path.basename(request.match_info.get("name", ""))
+        if name != request.match_info.get("name", "") or not name.startswith("cricket_result_") or not name.lower().endswith(".png"):
+            raise web.HTTPBadRequest(text="invalid cricket result name")
+        file_path = RUNTIME_STATE_DIR / "cricket_media" / name
+        if not file_path.is_file():
+            raise web.HTTPNotFound()
+        return web.FileResponse(file_path, headers={"Cache-Control": "public, max-age=86400"})
+
     async def published_handler(request):
         name = os.path.basename(request.match_info.get("name", ""))
         file_path = PUBLISH_LOCAL_DIR / name
@@ -2383,6 +2562,7 @@ async def start_media_server():
 
     app.router.add_get("/gifts/{name}", gift_handler)
     app.router.add_get("/games/{name}", game_handler)
+    app.router.add_get("/cricket-media/{name}", cricket_result_handler)
     app.router.add_get("/published/{name}", published_handler)
     app.router.add_post("/webhook", social_webhook)
     runner = web.AppRunner(app, access_log=None)
@@ -3021,10 +3201,54 @@ async def send_game_card(rid, game_key, title, lines, fallback_text=None):
         await room_send(rid, fallback_text)
 
 
+def interactive_game_definition(command):
+    cmd = str(command or "").strip().lower()
+    common = {"timeout_seconds": 60, "win_points": 50, "lose_points": 0}
+    if cmd in ("سؤال", "quiz"):
+        return {
+            **common, "command": cmd, "title": "تحدي المعلومات", "game_type": "quiz",
+            "questions": [
+                {"q": "ما عاصمة اليمن؟", "a": "صنعاء"},
+                {"q": "ما الكوكب المعروف بالكوكب الأحمر؟", "a": "المريخ"},
+                {"q": "كم ضلعاً للمثلث؟", "a": "3", "alt": ["ثلاثة"]},
+                {"q": "ما أكبر محيط على الأرض؟", "a": "المحيط الهادئ", "alt": ["الهادئ"]},
+                {"q": "ما الحيوان الذي يُلقب بسفينة الصحراء؟", "a": "الجمل"},
+            ],
+        }
+    if cmd in ("رياضيات", "math"):
+        return {**common, "command": cmd, "title": "تحدي الرياضيات", "game_type": "math"}
+    if cmd in ("تخمين", "خمن", "guess"):
+        return {**common, "command": cmd, "title": "خمن الرقم", "game_type": "guess", "max_number": 30, "max_attempts": 12}
+    if cmd in ("سرعة", "اسرع", "أسرع", "fastest"):
+        return {**common, "command": cmd, "title": "تحدي السرعة", "game_type": "fastest"}
+    if cmd in ("رتب", "كلمة", "word"):
+        return {**common, "command": cmd, "title": "رتب الحروف", "game_type": "word"}
+    if cmd in ("تحدي", "duel"):
+        return {
+            **common, "command": cmd, "title": "مواجهة سريعة", "game_type": "duel",
+            "timeout_seconds": 60, "win_points": 40, "lose_points": -10,
+        }
+    return None
+
+
 
 # ============================================================================
 # [قسم أوامر الغرف] BEGIN
 # ============================================================================
+
+def cricket_is_verified(username):
+    if not VERIFICATION_ENABLED:
+        return True
+    name = str(username or "").strip().lstrip("@").casefold()
+    if not name or name == OWNER:
+        return bool(name == OWNER)
+    for key, item in load_vip_users().items():
+        if str(key).strip().casefold() == name:
+            return True
+        if isinstance(item, dict) and str(item.get("username") or "").strip().lstrip("@").casefold() == name:
+            return True
+    return False
+
 
 async def handle_room(rid, text, uid, media_url=None, message_type=None):
     muted_for = await muted_minutes_remaining(rid, uid)
@@ -3034,9 +3258,38 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     p_name = await username_of(uid)
     lower_text = text.strip().lower()
 
+    repost_reply = await repost_explore(rid, uid, p_name, text)
+    if repost_reply is not None:
+        return repost_reply
+
     social_reply = await handle_social_reaction(rid, text, uid, p_name)
     if social_reply is not None:
         return social_reply
+
+    explore_match = re.fullmatch(r"(?:ax@|اكسبلور\s+|استكشف\s+)(.+)", text.strip(), re.I | re.S)
+    if explore_match:
+        vip_error = await require_vip(uid, p_name, "النشر في اكسبلور")
+        if vip_error:
+            return vip_error
+        return await publish_explore_post(rid, uid, p_name, explore_match.group(1))
+    if lower_text in ("ax@", "اكسبلور", "استكشف"):
+        return "✨ اكتب: ax@النص الذي تريد نشره في اكسبلور"
+
+    # تُعالج إجابات جولات الألعاب التفاعلية قبل بقية أوامر الغرفة.
+    if get_game_session(rid):
+        game_result = handle_game_message(rid, uid, p_name, text)
+        if game_result is not None:
+            for result_key in ("winner", "loser"):
+                result_player = game_result.get(result_key)
+                if isinstance(result_player, (tuple, list)) and len(result_player) >= 3:
+                    player_id, player_name, delta = result_player[:3]
+                    add_points(str(player_id), str(player_name), int(delta))
+            return str(game_result.get("text") or "") or None
+
+    if GAME_BRIDGE is not None:
+        game_handled, game_reply = await GAME_BRIDGE.handle_room(rid, uid, p_name, text)
+        if game_handled:
+            return game_reply
 
     admin_prefixes = ("+mf@", "-mf@", "clear@mf", "l@mf", "mf@on", "mf@off", "mf@status", "m@", "mute@", "um@", "unmute@", "mutes", "المكتومين", "قائمة الكتم",
                       "+wc ", "clear@wc", "l@wc", "wc@on", "wc@off", "mas@")
@@ -3315,7 +3568,14 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         return await send_image_search_command(rid, query)
 
     if text.strip().lower() in ("العاب", "ألعاب", "games", "gamehelp"):
-        return HELP_GAMES
+        return (
+            "🎮 الألعاب: سؤال/quiz، رياضيات، تخمين، سرعة، ترتيب، تحدي، وتعدين/احفر.\n"
+            "💎 فعالية الألماسة تُعلن تلقائياً؛ اكتب «تنقيب» أثناء الجولة للانضمام.\n"
+            "🔨 المزاد: افتح المزاد، مزايدة، ابدأ المزاد، زايد 100m، مرر، اقفل المزاد.\n"
+            "🎒 مخزون المزاد: sv — الاسترداد: red auction <رمز القطعة>.\n"
+            "🏏 الكريكيت: .cr 1 للإعداد، .cr 2..4 لعدد اللاعبين، .cr b لمباراة ضد البوت؛ الانضمام: Join.\n"
+            "🔒 ألعاب النقاط والمزاد والكريكيت تتطلب VIP. تشغيل/إيقاف المزاد والكريكيت من خاص الماستر."
+        )
 
     if text.strip().lower() in ("gv", "هدايا", "الهدايا", "gifts"):
         return await gift_catalog_message()
@@ -3327,7 +3587,11 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     cmd, arg = parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
 
     GAME_COMMANDS = {"عمل","job","كف","slap","مضاربة","bet","حرب","war","سرقة","rob","قتال","fight",
-                     "سباق","race","رشوة","سلة","قصف","اضرب","ورق","سدد","ملاكمة","بركان","شبح","حظ","نرد","تعدين","زواج","marriage"}
+                     "سباق","race","رشوة","سلة","قصف","اضرب","ورق","سدد","ملاكمة","بركان","شبح","حظ","نرد",
+                     "تعدين","تنقيب","احفر","dig","mine","حقيبتي","مخزني","كنوزي","inventory",
+                     "استبدال","استبدل","redeem","بيع","منقبين","المنقبين","miners",
+                     "سؤال","quiz","رياضيات","math","تخمين","خمن","guess","سرعة","اسرع","أسرع","fastest",
+                     "رتب","كلمة","word","تحدي","duel","زواج","marriage"}
 
     async def require_game_cooldown(game_command):
         ok_cd, rem_cd = check_cooldown(uid, p_name, f"game:{game_command}", int(C.get("game_cooldown_seconds", 30)))
@@ -3741,6 +4005,12 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         cd_error = await require_game_cooldown(cmd)
         if cd_error:
             return cd_error
+        if game_type_of(custom) != "chance":
+            if get_game_session(rid):
+                return "🎮 توجد جولة تفاعلية جارية في هذه الغرفة؛ أكملها أو ألغها أولاً."
+            intro, session = start_game_session(rid, custom, uid, p_name)
+            if session:
+                return intro
         await room_send(rid, f"🔎 جاري البحث عن {custom.get('title', cmd)}...")
         await asyncio.sleep(0.5)
         try:
@@ -3766,6 +4036,12 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         cd_error = await require_game_cooldown(cmd)
         if cd_error:
             return cd_error
+        if game_type_of(custom) != "chance":
+            if get_game_session(rid):
+                return "🎮 توجد جولة تفاعلية جارية في هذه الغرفة؛ أكملها أو ألغها أولاً."
+            intro, session = start_game_session(rid, custom, uid, p_name)
+            if session:
+                return intro
         await room_send(rid, f"🔎 جاري البحث عن {custom.get('title', cmd)}...")
         await asyncio.sleep(0.5)
         win = random.randint(1, 100) <= int(custom.get("win_chance", 50))
@@ -3774,6 +4050,17 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         await send_custom_game_result(rid, custom, p_name, win)
         msg = custom.get("win_message") if win else custom.get("lose_message")
         return f"{msg} @{p_name}\n💰 {'+' if delta >= 0 else ''}{delta} نقطة"
+
+    interactive_game = interactive_game_definition(cmd)
+    if interactive_game:
+        cd_error = await require_game_cooldown(cmd)
+        if cd_error:
+            return cd_error
+        if get_game_session(rid):
+            return "🎮 توجد جولة تفاعلية جارية في هذه الغرفة؛ أكملها أو ألغها أولاً."
+        intro, session = start_game_session(rid, interactive_game, uid, p_name)
+        if session:
+            return intro
 
     if cmd in games_map:
         cd_error = await require_game_cooldown(cmd)
@@ -3793,13 +4080,89 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
 # [لعبة تعدين] BEGIN
 # -----------------------------------------------------------------------------
 
-    if cmd == "تعدين":
-        cd_error = await require_game_cooldown(cmd)
-        if cd_error:
-            return cd_error
-        found = random.randint(200, 500); add_points(uid, p_name, found)
-        await send_game_card(rid, "mine", "⛏️ Mine | تعدين", [f"👤 اللاعب: @{p_name}", "🏆 Winner | الفائز", f"💰 النتيجة: +{found} نقطة"], f"⛏️ وجدت ذهباً! @{p_name} +{found} ن.")
-        return None
+    if cmd in ("تعدين", "تنقيب", "احفر", "dig", "mine"):
+        result = await asyncio.to_thread(MINING_STORE.dig, str(uid), p_name)
+        if not result.get("ok"):
+            if result.get("error") == "cooldown":
+                return f"⏳ انتظر {format_cooldown(result.get('remaining', 0))} قبل التنقيب مرة أخرى."
+            if result.get("error") == "pending_redemption":
+                return "⌛ لديك استبدال كنوز قيد المعالجة؛ أعد المحاولة بعد لحظات."
+            return "❌ تعذر تسجيل محاولة التنقيب الآن."
+        item = result.get("item")
+        if not item:
+            return "⛏️ لم تعثر على كنز هذه المرة؛ جرّب بعد انتهاء المهلة."
+        return (
+            f"⛏️ @{p_name} عثر على {item.get('icon', '💎')} {item.get('name', 'كنز')}!\n"
+            f"💎 إجمالي الألماس المكتشف: {result.get('diamonds_found', 0)}\n"
+            "اكتب «حقيبتي» لعرض الكنوز، أو «استبدال [اسم الكنز] [العدد]» لتحويلها إلى نقاط."
+        )
+
+    if cmd in ("حقيبتي", "مخزني", "كنوزي", "inventory"):
+        try:
+            inventory_data = await asyncio.to_thread(MINING_STORE.inventory, str(uid), p_name)
+        except Exception:
+            return "❌ تعذر قراءة حقيبة الكنوز الآن."
+        rows = [
+            f"{MINING_ITEMS.get(key, {}).get('icon', '💎')} {MINING_ITEMS.get(key, {}).get('name', key)}: {count}"
+            for key, count in inventory_data.get("inventory", {}).items() if int(count or 0) > 0
+        ]
+        if not rows:
+            rows = ["لا توجد كنوز بعد؛ اكتب «تعدين» لتبدأ التنقيب."]
+        return (
+            f"🎒 حقيبة @{p_name}\n" + "\n".join(rows) +
+            f"\n💎 الألماس المكتشف: {inventory_data.get('diamonds_found', 0)}"
+        )
+
+    if cmd in ("استبدال", "استبدل", "redeem", "بيع"):
+        selector = arg.strip()
+        quantity = None
+        if selector:
+            tokens = selector.rsplit(maxsplit=1)
+            last = tokens[-1].translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+            if last.isdigit():
+                quantity = int(last)
+                selector = tokens[0] if len(tokens) > 1 else ""
+        try:
+            inventory_data = await asyncio.to_thread(MINING_STORE.inventory, str(uid), p_name)
+            item_keys = resolve_item_keys(selector) if selector and selector not in ("الكل", "كل", "all") else tuple(inventory_data["inventory"].keys())
+            if not item_keys:
+                return "❌ اسم الكنز غير معروف. مثال: استبدال ألماس أزرق 2"
+            reservation = await asyncio.to_thread(
+                MINING_STORE.reserve_redemption, str(uid), p_name, item_keys, quantity,
+            )
+            if not reservation.get("ok"):
+                errors = {
+                    "empty_inventory": "❌ لا تملك من هذا الكنز ما يمكن استبداله.",
+                    "insufficient_items": f"❌ الكمية غير كافية؛ الموجود: {reservation.get('available', 0)}.",
+                    "pending_redemption": "⌛ لديك استبدال سابق قيد المعالجة.",
+                    "invalid_quantity": "❌ أدخل عدداً صحيحاً أكبر من صفر.",
+                }
+                return errors.get(reservation.get("error"), "❌ تعذر حجز الكنوز للاستبدال.")
+            pending = reservation["pending"]
+            credited = await asyncio.to_thread(
+                apply_point_delta_once, str(uid), p_name, int(pending["points"]),
+                f"mining-redemption:{pending['id']}", "mining treasure redemption",
+            )
+            if not credited.get("ok"):
+                return "⌛ تم حفظ الاستبدال وسيكتمل تلقائياً عند إعادة المحاولة أو تشغيل البوت."
+            completed = await asyncio.to_thread(
+                MINING_STORE.complete_redemption, str(uid), str(pending["id"]),
+            )
+            if not completed:
+                return "⌛ أضيفت النقاط بأمان؛ سيكتمل تحديث الحقيبة تلقائياً."
+            return f"✅ استبدلت الكنوز وحصلت على {pending['points']:,} نقطة. رصيدك الآن: {credited['balance']:,}."
+        except Exception:
+            log.exception("mining redemption failed for user %s", uid)
+            return "❌ تعذر إتمام الاستبدال الآن؛ لم تُمنح نقاط مكررة، أعد المحاولة لاحقاً."
+
+    if cmd in ("منقبين", "المنقبين", "miners"):
+        rows = await asyncio.to_thread(MINING_STORE.leaderboard, 10)
+        if not rows:
+            return "💎 لا توجد اكتشافات ألماس بعد."
+        return "🏆 أكثر المنقبين اكتشافاً للألماس:\n" + "\n".join(
+            f"{index}. @{row['username']} — {row['diamonds_found']} 💎"
+            for index, row in enumerate(rows, 1)
+        )
 
 # -----------------------------------------------------------------------------
 # [لعبة تعدين] END
@@ -4719,8 +5082,13 @@ async def dm_loop():
                     parts = text.split(maxsplit=1)
                     cmd, arg = parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
                     low = normalize_text(text)
-                    is_owner = (await username_of(sender)).lower() == OWNER
+                    sender_name = await username_of(sender)
+                    is_owner = sender_name.lower() == OWNER
                     reply = ""
+                    private_game_handled = False
+                    if GAME_BRIDGE is not None:
+                        private_game_handled, private_game_reply = await GAME_BRIDGE.handle_private(sender, sender_name, text)
+                        reply = private_game_reply or ""
                     # رد فوري + مؤشر تقدم للماستر أثناء الأوامر البطيئة.
                     # لا نرسل مؤشر تقدم متكرر مع أوامر التشخيص؛ التشخيص المباشر يجب أن يعيد نتيجة واحدة.
                     is_diagnostic_command = low.startswith(("اصلاح ذكي ", "إصلاح ذكي "))
@@ -4744,7 +5112,9 @@ async def dm_loop():
                             progress_task = asyncio.create_task(_master_progress(), name="master-command-progress")
                         except Exception:
                             log.exception("failed to start master progress reporter")
-                    if cmd in ("دخول", "join") and is_owner:
+                    if private_game_handled:
+                        pass
+                    elif cmd in ("دخول", "join") and is_owner:
                         ok, m = await join(arg); reply = ("✅ " if ok else "❌ ") + m
                     elif cmd in ("خروج", "leave") and is_owner:
                         ok, m = await leave(arg); reply = ("✅ " if ok else "❌ ") + m
@@ -4767,6 +5137,8 @@ async def dm_loop():
                                  "اضف لعبة اسم | وصف — وضع اللعبة في testing\n"
                                  "اعتماد لعبة command — نقل اللعبة إلى approved\n"
                                  "العاب الاختبار — عرض ألعاب الاختبار\n"
+                                 "تشغيل لعبة مزاد / إيقاف لعبة مزاد — إدارة المزاد\n"
+                                 "تشغيل لعبة الكريكيت / إيقاف لعبة الكريكيت — إدارة الكريكيت\n"
                                  "غرفي — عرض الغرف المتصلة\n"
                                  "دخول اسم / خروج اسم — إدارة الغرف")
                     elif text and (cmd in ("اصلاح", "إصلاح", "ذكاء", "ai", "صمم", "اضف", "أضف", "اعتماد", "اعتمد", "تشغيل", "إيقاف", "ايقاف", "حذف", "احذف", "تعطيل", "تفعيل", "حالة", "الأوامر", "الاوامر") or low.startswith(("اصلاح ", "إصلاح ", "صمم ", "اضف لعبة ", "أضف لعبة ", "اضف امر ", "أضف أمر ", "اضف أمر ", "حذف لعبة ", "احذف لعبة ", "حذف لعبه ", "احذف لعبه ", "حذف امر ", "احذف امر ", "حذف أمر ", "احذف أمر ", "تعطيل امر ", "تعطيل أمر ", "تفعيل امر ", "تفعيل أمر ", "اعتماد لعبة ", "اعتمد لعبة ", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق", "حالة التوثيق", "اصلاح ذاتيا", "إصلاح ذاتياً", "حالة البوت", "الأوامر المضافة", "الاوامر المضافة"))):
@@ -4814,6 +5186,11 @@ async def heartbeat_loop():
     global LAST_HEARTBEAT_AT, LAST_DB_OK_AT
     while True:
         now = time.time()
+        for expired_rid, session in expired_game_sessions():
+            try:
+                await room_send(expired_rid, game_timeout_text(session))
+            except Exception:
+                log.exception("failed to announce interactive game timeout in room %s", expired_rid)
         for rid in list(rooms):
             data, err = await rpc("room_heartbeat", {"_room": rid})
             if not err:
@@ -4831,7 +5208,21 @@ async def heartbeat_loop():
             created = pending.get("created_at", 0) if isinstance(pending, dict) else pending
             if now - created > 120:
                 publish_pending.pop(key, None)
+        if GAME_BRIDGE is not None:
+            try:
+                await GAME_BRIDGE.tick_rare_diamond()
+            except Exception:
+                log.exception("rare diamond event loop failed")
         await asyncio.sleep(10)
+
+async def auction_watch_loop():
+    while True:
+        if GAME_BRIDGE is not None:
+            try:
+                await GAME_BRIDGE.tick_auction()
+            except Exception:
+                log.exception("auction timer loop failed")
+        await asyncio.sleep(1)
 
 async def session_loop():
     while True:
@@ -4882,7 +5273,7 @@ async def network_loop():
         await asyncio.sleep(10)
 
 async def main():
-    global http, BOT_ID
+    global http, BOT_ID, GAME_BRIDGE
     http = aiohttp.ClientSession()
     try:
         await start_media_server()
@@ -4898,16 +5289,38 @@ async def main():
         if not res or not getattr(res, "user", None):
             raise RuntimeError("رفض Giant Chat تسجيل الدخول ولم يُرجع مستخدمًا.")
         BOT_ID = res.user.id
+        GAME_BRIDGE = GiantGameBridge(
+            RUNTIME_STATE_DIR, BASE_DIR / "assets",
+            send_room_text=room_send,
+            send_room_media=room_send_media,
+            send_dm=dm_send,
+            broadcast_text=broadcast_text,
+            get_rooms=lambda: list(rooms),
+            is_vip=is_vip,
+            cricket_is_verified=cricket_is_verified,
+            lookup_profile=giant_target,
+            balance=lambda user_id, username: int(load_points().get(str(user_id), {}).get("points", 0) or 0),
+            apply_delta=apply_point_delta_once,
+            public_base=lambda: (PUBLIC_BASE_URL or PUBLISH_PUBLIC_BASE_URL or GAME_BASE_URL),
+            owner_name=OWNER,
+            bot_name=USERNAME,
+            log=lambda *args: log.info("%s", " ".join(str(value) for value in args)),
+        )
         cookie_ok, cookie_msg = youtube_cookie_status()
         log.info("YouTube cookies: %s | %s", "OK" if cookie_ok else "NOT-READY", cookie_msg)
         log.info("YouTube player clients: %s | PO token: %s", os.environ.get("YOUTUBE_PLAYER_CLIENTS") or C.get("youtube_player_clients", "web_safari,tv,web"), "configured" if YOUTUBE_PO_TOKEN else "not configured")
         await prepare_game_assets()
         global AUTH_ACCESS_TOKEN
         AUTH_ACCESS_TOKEN = getattr(getattr(res, "session", None), "access_token", None)
+        recovered_mining = await asyncio.to_thread(recover_mining_redemptions)
+        if recovered_mining:
+            log.info("Recovered %s pending mining redemption(s)", recovered_mining)
         await restore_rooms()
         # إذا كانت الغرف محفوظة من قبل، أعد الانضمام إليها حتى لو خرج البوت بسبب انقطاع الشبكة.
         if not rooms:
             await restore_saved_rooms()
+        await GAME_BRIDGE.recover()
+        await GAME_BRIDGE.tick_rare_diamond()
         log.info("حالة الذكاء المحلي: %s", local_ai_status_text())
         log.info("البوت لا يحتاج إلى مفتاح OpenAI.")
         # تنزيل نموذج Qwen GGUF تلقائياً في الخلفية عند تشغيل Railway.
@@ -4917,7 +5330,7 @@ async def main():
         log.info("البوت جاهز كـ @%s", USERNAME)
         music_task = asyncio.create_task(music_worker_queue(), name="music-queue")
         try:
-            await asyncio.gather(dm_loop(), room_loop(), heartbeat_loop(), session_loop(), network_loop())
+            await asyncio.gather(dm_loop(), room_loop(), heartbeat_loop(), session_loop(), network_loop(), auction_watch_loop())
         finally:
             music_task.cancel()
             try: await music_task
