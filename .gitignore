@@ -1,1 +1,7 @@
 runtime_state/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*
+generated_gifts/test_*.png

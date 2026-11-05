@@ -1,0 +1,14 @@
+{
+  "supabase_url": "https://YOUR_PROJECT.supabase.co",
+  "supabase_key": "PASTE_SUPABASE_ANON_OR_PUBLISHABLE_KEY",
+  "username": "GIANT_BOT_USERNAME",
+  "password": "GIANT_BOT_PASSWORD",
+  "owner_username": "BOT_OWNER_USERNAME",
+  "verification_enabled": true,
+  "vip_required_for_games": true,
+  "vip_required_for_music": true,
+  "vip_required_for_publish": true,
+  "poll_seconds": 2,
+  "game_cooldown_seconds": 40,
+  "million_cooldown_seconds": 60
+}

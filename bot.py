@@ -81,7 +81,7 @@ except ImportError:
     yt_dlp = None
 from supabase import create_client
 from explore_cards import render_explore_card
-from point_transactions import apply_delta_once as apply_point_transaction
+from point_transactions import apply_delta_once as apply_point_transaction, apply_deltas_once as apply_point_multi_transaction
 from gift_assets import extend_gift_image_paths
 from giant_game_bridge import GiantGameBridge
 from treasure_mining import ITEMS as MINING_ITEMS, MiningStore, format_cooldown, resolve_item_keys
@@ -770,6 +770,18 @@ def apply_point_delta_once(uid, username, amount, transaction_id, reason=""):
         result, changed = apply_point_transaction(points, str(uid), username, int(amount), transaction_id)
         if changed:
             save_points(points)
+        return result
+
+
+def apply_point_deltas_once(deltas, usernames, transaction_id, reason=""):
+    """Apply a point transfer across UUID accounts in one locked JSON commit."""
+    with POINTS_LOCK:
+        points = load_points()
+        result, changed = apply_point_multi_transaction(points, deltas, usernames, transaction_id)
+        if changed:
+            save_points(points)
+        if result.get("ok"):
+            result["reason"] = str(reason or "multi-account point transaction")
         return result
 
 
@@ -3250,7 +3262,7 @@ def cricket_is_verified(username):
     return False
 
 
-async def handle_room(rid, text, uid, media_url=None, message_type=None):
+async def handle_room(rid, text, uid, media_url=None, message_type=None, message_id=None):
     muted_for = await muted_minutes_remaining(rid, uid)
     if muted_for:
         log.info("رسالة متجاهلة من مستخدم مكتوم room=%s user=%s remaining=%sm", rid, uid, muted_for)
@@ -3287,7 +3299,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             return str(game_result.get("text") or "") or None
 
     if GAME_BRIDGE is not None:
-        game_handled, game_reply = await GAME_BRIDGE.handle_room(rid, uid, p_name, text)
+        game_handled, game_reply = await GAME_BRIDGE.handle_room(rid, uid, p_name, text, str(message_id or ""))
         if game_handled:
             return game_reply
 
@@ -5175,7 +5187,7 @@ async def room_loop():
                     message_type = m.get("message_type")
                     # نحتاج معالجة رسالة الصورة حتى لو كان content فارغاً، لأن نشر@ ينتظر الصورة في الرسالة التالية.
                     if text or ((rid, m.get("user_id")) in publish_pending and media_url):
-                        reply = await handle_room(rid, text, m.get("user_id"), media_url, message_type)
+                        reply = await handle_room(rid, text, m.get("user_id"), media_url, message_type, m.get("id"))
                         if reply: await room_send(rid, reply)
         except Exception:
             log.exception("room loop error")
@@ -5210,9 +5222,11 @@ async def heartbeat_loop():
                 publish_pending.pop(key, None)
         if GAME_BRIDGE is not None:
             try:
-                await GAME_BRIDGE.tick_rare_diamond()
+                await GAME_BRIDGE.tick_timed_events()
+                await GAME_BRIDGE.tick_board_games()
+                await GAME_BRIDGE.tick_financial()
             except Exception:
-                log.exception("rare diamond event loop failed")
+                log.exception("Talkin2 timed event/board-game loop failed")
         await asyncio.sleep(10)
 
 async def auction_watch_loop():
@@ -5305,6 +5319,7 @@ async def main():
             owner_name=OWNER,
             bot_name=USERNAME,
             log=lambda *args: log.info("%s", " ".join(str(value) for value in args)),
+            apply_deltas=apply_point_deltas_once,
         )
         cookie_ok, cookie_msg = youtube_cookie_status()
         log.info("YouTube cookies: %s | %s", "OK" if cookie_ok else "NOT-READY", cookie_msg)
@@ -5320,7 +5335,9 @@ async def main():
         if not rooms:
             await restore_saved_rooms()
         await GAME_BRIDGE.recover()
-        await GAME_BRIDGE.tick_rare_diamond()
+        await GAME_BRIDGE.recover_financial_intents()
+        await GAME_BRIDGE.tick_timed_events()
+        await GAME_BRIDGE.tick_board_games()
         log.info("حالة الذكاء المحلي: %s", local_ai_status_text())
         log.info("البوت لا يحتاج إلى مفتاح OpenAI.")
         # تنزيل نموذج Qwen GGUF تلقائياً في الخلفية عند تشغيل Railway.

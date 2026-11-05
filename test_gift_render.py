@@ -10,6 +10,8 @@ except ImportError:
 base = Path(__file__).resolve().parent
 template = base / "assets" / "gift_template_elegant.png"
 source = Path("/mnt/data/a_romantic_gift_card_banner_design_overall_scen.png")
+if not source.is_file():
+    source = template
 out = base / "generated_gifts" / "test_elegant_arabic.png"
 
 def shape(text):
