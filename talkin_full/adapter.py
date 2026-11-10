@@ -60,7 +60,7 @@ class GiantTalkinBot(tb.TalkinBot):
         return self._giant_orig_decode(message)
 
     def _display_username(self, user_id: str) -> str:
-        name = self.api.username(user_id)
+        name = self.api.display_name(user_id)
         return name or f"user_{str(user_id or '')[:8]}"
 
     def feed_room_message(self, row: dict) -> None:

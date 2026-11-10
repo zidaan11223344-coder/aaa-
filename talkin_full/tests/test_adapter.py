@@ -42,7 +42,7 @@ class FakeApi:
                 return rid
         return ""
 
-    def username(self, uid):
+    def display_name(self, uid):
         return self.users.get(str(uid), "")
 
     def resolve_user_id(self, name):

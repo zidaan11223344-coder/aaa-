@@ -191,7 +191,7 @@ class GiantApi:
             self._photos[uid] = photo
             self._photos[name.casefold()] = photo
 
-    def username(self, uid: str) -> str:
+    def display_name(self, uid: str) -> str:
         uid = str(uid or "").strip()
         if not uid:
             return ""
