@@ -9,6 +9,13 @@ python-bidi>=0.4.2
 requests>=2.31.0
 python-dotenv>=1.0.0
 
+# وحدات بوت Talkin المضمّن (talkin_full/vendor)
+fonttools>=4.50
+pytesseract>=0.3.13
+ffmpeg-python>=0.2.0
+psycopg[binary]>=3.2
+pymysql>=1.1
+
 # Local AI inference (CPU) - use the official pre-built CPU wheels on Railway
 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 llama-cpp-python>=0.3.35

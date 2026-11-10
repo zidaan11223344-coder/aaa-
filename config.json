@@ -45,5 +45,9 @@
   "verification_enabled": true,
   "million_cooldown_seconds": 120,
   "game_result_images_only_after_end": true,
-  "war_global_match": true
+  "war_global_match": true,
+  "talkin_verification_enabled": false,
+  "talkin_sync_vip": true,
+  "talkin_rooms": [],
+  "talkin_data_dir": "runtime_state/talkin"
 }
